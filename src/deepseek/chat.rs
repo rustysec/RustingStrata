@@ -89,7 +89,7 @@ fn ctx_limit(g: &Gguf) -> usize {
 /// `rustingstrata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
 /// Earlier reasoning is kept by default, like llama-server (`chat_template_kwargs.preserve_thinking:false` drops it).
 /// ponytail: greedy only, no tools/stop strings; the KV cache is reused only when the new prompt extends the last sequence.
-pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>, allowed: &[String]) -> anyhow::Result<()> {
     use serde_json::json;
     gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
@@ -97,7 +97,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
     let eos = tok.eos_ids();
     let ctx = ctx_limit(g);
     let l = std::net::TcpListener::bind(addr)?;
-    eprintln!("deepseek serve on http://{addr}/ model {name}");
+    eprintln!("deepseek serve on http://{addr}/ model {name}{}", crate::serve::serve_hosts(api_key.is_some(), allowed));
     for c in l.incoming() {
         let Ok(mut c) = c else { continue };
         let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
@@ -109,8 +109,8 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
         let path = r.path.split('?').next().unwrap_or("");
         // /health stays open for load balancers, like the main server.
         // Without a key the Host check stops DNS rebinding, as in the main server.
-        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, &[]) {
-            send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
+        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, allowed) {
+            send(&mut c, "403 Forbidden", "application/json", &crate::serve::host_forbidden(&r.host, addr, allowed));
             continue;
         }
         if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {

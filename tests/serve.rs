@@ -1,5 +1,36 @@
 use rusting_strata::chat::{Hold, Json, Msg, Template};
-use rusting_strata::serve::{Keys, Who, chat_request, host_ok, key_ok, list_models, messages_body, models, read_request};
+use rusting_strata::serve::{Keys, Who, allowed_hosts, chat_request, host_forbidden, host_message, host_ok, key_ok, list_models, merge_hosts, messages_body, models, read_request, serve_hosts};
+
+/// A proxy sends the `Host` its own client used, not the one the engine is bound to - and llama-swap, nginx and
+/// friends all forward a port that is theirs, not the upstream's. `--allowed-hosts` has to survive that, for every
+/// server: the four per-architecture ones (`hy_v4_flash` and the rest) used to check against an empty list, so the
+/// name was refused no matter what was configured.
+#[test]
+fn a_proxied_host_is_allowed_by_name_not_by_luck() {
+    let lan = ["llama".to_string(), "llama.lan".to_string()];
+    // Bound to every interface on one port, reached through the proxy on another.
+    assert!(host_ok("llama:10000", "0.0.0.0:58123", &lan));
+    assert!(host_ok("llama.lan:10000", "0.0.0.0:58123", &lan));
+    assert!(host_ok("LLAMA", "0.0.0.0:58123", &lan), "the header is case-insensitive");
+    assert!(!host_ok("attacker.example:10000", "0.0.0.0:58123", &lan), "a name on the list is not any name");
+    assert!(!host_ok("llama.evil:10000", "0.0.0.0:58123", &lan));
+
+    // The flag and the variable are one list, whichever of the two the operator used.
+    assert_eq!(merge_hosts(&["a".into()], Some("b, c ,,")).join(","), "a,b,c");
+    assert_eq!(merge_hosts(&[], None).join(","), "");
+    let from_env = allowed_hosts(&[]);
+    assert!(from_env.is_empty() || from_env.iter().any(|h| !h.is_empty()), "{from_env:?}: an unset variable adds nothing");
+
+    // And a 403 says what arrived: the operator is looking at the host they typed, not the one the proxy sent.
+    let m = host_message("llama:10000", "0.0.0.0:58123", &lan);
+    assert!(m.contains("llama:10000") && m.contains("0.0.0.0:58123") && m.contains("llama.lan"), "{m}");
+    assert!(host_message("x.test:1", "127.0.0.1:8080", &[]).contains("--allowed-hosts"));
+    let body: serde_json::Value = serde_json::from_str(&host_forbidden("x.test:1", "127.0.0.1:8080", &lan)).unwrap();
+    assert_eq!(body["error"]["type"].as_str(), Some("forbidden"));
+    assert!(body["error"]["message"].as_str().is_some_and(|s| s.contains("x.test:1")));
+    // What the server prints when it binds, so the rule is known before the first request.
+    assert!(serve_hosts(false, &lan).contains("llama.lan") && serve_hosts(true, &lan).contains("not checked"));
+}
 
 /// Every request in tests/fixtures/chat renders byte-identical to llama.cpp's Jinja rendering of the model's own
 /// template (tools/gen_chat_fixtures.py); a request llama.cpp rejects must be rejected too.
@@ -345,6 +376,35 @@ fn per_key_holds() {
     assert!(c.is_some());
     drop((b, c));
     assert!(open.lock().unwrap().is_empty());
+}
+
+/// The same, with the variable instead of the flag and a proxy's port on the `Host` (llama-swap's setup: it forwards
+/// the client's `Host`, whose port is its own, while the engine is bound to another).
+#[test]
+fn serve_allows_the_hosts_named_in_the_environment() {
+    use std::io::{Read, Write};
+    let dir = std::env::temp_dir().join(format!("strata-host-env-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut p = std::process::Command::new(env!("CARGO_BIN_EXE_rustingstrata"))
+        .args(["serve", "--addr", &addr]).arg("--models-dir").arg(&dir)
+        .env("STRATA_ALLOWED_HOSTS", "llama, llama.lan")
+        .env_remove("STRATA_API_KEY")
+        .stderr(std::process::Stdio::null()).spawn().unwrap();
+    let get = |host: &str| -> String {
+        let mut c = (0..100).find_map(|_| std::net::TcpStream::connect(&addr).ok().or_else(|| { std::thread::sleep(std::time::Duration::from_millis(50)); None }))
+            .expect("server up");
+        c.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).unwrap();
+        let mut s = String::new();
+        c.read_to_string(&mut s).unwrap();
+        s.lines().next().unwrap_or_default().to_string()
+    };
+    assert!(get("llama:10000").contains("200"), "the proxy's own port must not matter");
+    assert!(get("llama.lan:10000").contains("200"));
+    assert!(get("evil.example:10000").contains("403"));
+    let _ = p.kill();
+    let _ = p.wait();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A server with no keys checks `Host`; `--allowed-hosts` adds a LAN name without opening it to other names.

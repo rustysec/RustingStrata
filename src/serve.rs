@@ -89,6 +89,49 @@ pub fn host_ok(host: &str, bound: &str, allowed: &[String]) -> bool {
     !n.is_empty() && (matches!(n.as_str(), "localhost" | "127.0.0.1" | "[::1]") || n == name(bound) || allowed.iter().any(|a| name(a) == n))
 }
 
+/// `--allowed-hosts` and `STRATA_ALLOWED_HOSTS` as one list. Every server merges them through here: the four
+/// per-architecture ones (`hy_v4_flash`, `deepseek41`, `glm5-next`, `gemma4`) used to pass an empty list to `host_ok`,
+/// so a proxy in front of the engine (llama-swap, nginx, anything that forwards the client's `Host`) got a 403 that no
+/// flag could turn off.
+pub fn allowed_hosts(extra: &[String]) -> Vec<String> {
+    merge_hosts(extra, std::env::var("STRATA_ALLOWED_HOSTS").ok().as_deref())
+}
+
+/// The same, with the variable's value passed in, so the merge is testable without setting the environment of the
+/// whole test process.
+pub fn merge_hosts(extra: &[String], env: Option<&str>) -> Vec<String> {
+    let mut v = extra.to_vec();
+    if let Some(s) = env { v.extend(s.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned)); }
+    v
+}
+
+/// The 403 message for a `Host` the server will not answer. It names the Host it *received*, because that is not the
+/// one the operator typed: a proxy substitutes its own (or the upstream's), and "bad Host header" alone gives no way to
+/// tell which, nor which name to add to the list.
+pub fn host_message(host: &str, bound: &str, allowed: &[String]) -> String {
+    let mut m = format!("bad Host header: got {host:?}, which is not localhost nor the address this server is bound to ({bound:?}).");
+    m.push_str(&if allowed.is_empty() {
+        " Name the host a proxy sends with --allowed-hosts (or $STRATA_ALLOWED_HOSTS), or set --api-key, which skips this check."
+            .to_string()
+    } else {
+        format!(" Allowed here: {}. Set --api-key to skip the check.", allowed.join(", "))
+    });
+    m
+}
+
+/// The same as a JSON body, for the servers that write their responses as raw text.
+pub fn host_forbidden(host: &str, bound: &str, allowed: &[String]) -> String {
+    serde_json::json!({"error": {"message": host_message(host, bound, allowed), "type": "forbidden"}}).to_string()
+}
+
+/// The startup line's tail: which `Host` values a request may carry. Said once when the socket is bound, because a 403
+/// several minutes later - after a 100 GB model loaded - is otherwise impossible to explain. `skip` is true when a key
+/// is set (a rebinding page has no key, so the check is not needed) or the server has customer keys.
+pub fn serve_hosts(skip: bool, allowed: &[String]) -> String {
+    if skip { return " (Host header not checked: a key is required)".to_string(); }
+    format!("; Hosts accepted besides localhost: {}", if allowed.is_empty() { "none".into() } else { allowed.join(", ") })
+}
+
 /// Whether the client closed the connection (it sends nothing more after its request).
 pub fn gone(c: &std::net::TcpStream) -> bool {
     if c.set_nonblocking(true).is_err() { return false; }

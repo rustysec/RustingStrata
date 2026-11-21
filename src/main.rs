@@ -1385,6 +1385,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
             engine.ds_env();
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
+            // Merged before any server starts: the four per-architecture servers take the same list the main one does,
+            // so `--allowed-hosts` and `$STRATA_ALLOWED_HOSTS` mean the same thing whichever model is being served. A
+            // proxy in front of the engine forwards the client's `Host`, and these were the servers where that came
+            // back as an unfixable 403.
+            let allowed_hosts = serve::allowed_hosts(&host.allowed_hosts);
             // The four architectures below have their own servers, which keep the model for as long as they run.
             let arch = model.as_deref().and_then(Gguf::arch);
             if host.auto_unload.is_some() && let Some(a) = arch.as_deref() && ["gemma4", "glm5-next", "deepseek41", rusting_strata::hy4::ARCH].contains(&a) {
@@ -1396,38 +1401,34 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(mp));
-                return rusting_strata::gemma4::serve(&g, &name, &addr, key.as_deref(), mmproj.as_deref());
+                return rusting_strata::gemma4::serve(&g, &name, &addr, key.as_deref(), mmproj.as_deref(), &allowed_hosts);
             }
             if let Some(mp) = &model && arch.as_deref() == Some("glm5-next") {
                 let g = Gguf::open(mp)?;
                 let name = mp.file_name().map_or("glm".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-                return rusting_strata::glm::serve(&g, &name, &addr, key.as_deref());
+                return rusting_strata::glm::serve(&g, &name, &addr, key.as_deref(), &allowed_hosts);
             }
             if let Some(mp) = &model && arch.as_deref() == Some("deepseek41") {
                 let g = Gguf::open(mp)?;
                 let name = mp.file_name().map_or("deepseek".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-                return rusting_strata::deepseek::chat::serve(&g, &name, &addr, key.as_deref());
+                return rusting_strata::deepseek::chat::serve(&g, &name, &addr, key.as_deref(), &allowed_hosts);
             }
             if let Some(mp) = &model && arch.as_deref() == Some(rusting_strata::hy4::ARCH) {
                 let g = Gguf::open(mp)?;
                 let name = mp.file_name().map_or("hy4".into(), |n| n.to_string_lossy().into_owned());
                 let key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
                 anyhow::ensure!(key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-                return rusting_strata::hy4::chat::serve(&g, &name, &addr, key.as_deref());
+                return rusting_strata::hy4::chat::serve(&g, &name, &addr, key.as_deref(), &allowed_hosts);
             }
             engine.parallel = host.parallel;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
             anyhow::ensure!((1..=255).contains(&engine.parallel), "--parallel {}: 1 to 255 slots", engine.parallel);
             let api_key = api_key.or_else(|| std::env::var("STRATA_API_KEY").ok());
             anyhow::ensure!(api_key.as_ref().is_none_or(|k| !k.is_empty()), "empty API key");
-            let mut allowed_hosts = host.allowed_hosts.clone();
-            if allowed_hosts.is_empty() && let Ok(v) = std::env::var("STRATA_ALLOWED_HOSTS") {
-                allowed_hosts.extend(v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned));
-            }
             let mut keys_time = host.api_keys.as_ref().and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
             let users = match &host.api_keys {
                 Some(f) => serve::Keys::parse(&std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?)
@@ -1615,7 +1616,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 dl: Default::default(), stats, opts: Default::default(), idle: host.auto_unload.map(Duration::from_secs), asleep: Default::default(), parked: Default::default() };
             // The model to load next and the /api/load request waiting for the outcome (none for --model).
             let mut next = model.map(|p| (p, None));
-            eprintln!("listening on {url} (models folder: {})", s.dir.display());
+            eprintln!("listening on {url} (models folder: {}){}", s.dir.display(),
+                serve::serve_hosts(s.keys.read().unwrap().any(), &s.allowed_hosts));
             // Chats wait while a model loads; the page shows at once.
             if open { open_browser(&url); }
             loop {
@@ -2670,7 +2672,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // makes a cross-site POST need a CORS preflight, which is never answered.
     // With a key the check is not needed (a rebinding page has no key) and would refuse a reverse proxy's Host.
     let keys = s.keys.read().unwrap().clone();
-    if !keys.any() && !serve::host_ok(&host, &s.addr, &s.allowed_hosts) { return send(&mut w, "403 Forbidden", json!({"error": {"message": "bad Host header: name this host with --allowed-hosts, or set --api-key", "type": "forbidden"}})); }
+    if !keys.any() && !serve::host_ok(&host, &s.addr, &s.allowed_hosts) { return send(&mut w, "403 Forbidden", json!({"error": {"message": serve::host_message(&host, &s.addr, &s.allowed_hosts), "type": "forbidden"}})); }
     let Some(who) = keys.who(&auth) else { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})) };
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
     // Claude Code adds `?beta=true`.

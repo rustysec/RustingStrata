@@ -269,6 +269,7 @@ pub fn serve(
     addr: &str,
     api_key: Option<&str>,
     mmproj: Option<&std::path::Path>,
+    allowed: &[String],
 ) -> anyhow::Result<()> {
     use serde_json::json;
     use std::io::Write;
@@ -279,7 +280,7 @@ pub fn serve(
     let stop = stop_ids(&tok);
     let ctx = m.cfg.n_ctx_train;
     let l = std::net::TcpListener::bind(addr)?;
-    eprintln!("gemma4 serve on http://{addr}/ model {name}");
+    eprintln!("gemma4 serve on http://{addr}/ model {name}{}", crate::serve::serve_hosts(api_key.is_some(), allowed));
     for c in l.incoming() {
         let Ok(mut c) = c else { continue };
         let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
@@ -289,8 +290,8 @@ pub fn serve(
             let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
         };
         let path = r.path.split('?').next().unwrap_or("");
-        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, &[]) {
-            send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
+        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, allowed) {
+            send(&mut c, "403 Forbidden", "application/json", &crate::serve::host_forbidden(&r.host, addr, allowed));
             continue;
         }
         if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {

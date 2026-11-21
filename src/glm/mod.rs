@@ -409,7 +409,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize) -> anyhow::Result<()> {
 
 /// `rustingstrata serve` for GLM: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
 /// ponytail: greedy only, no stop strings; prompt + reply limited to the model's context (STRATA_GLM_CTX overrides); KV reused when the prompt extends it.
-pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow::Result<()> {
+pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>, allowed: &[String]) -> anyhow::Result<()> {
     use serde_json::json;
     use std::io::Write;
     gpu_defaults();
@@ -418,7 +418,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
     let stop = stop_ids(g, &tok);
     let ctx = ctx_limit(&m);
     let l = std::net::TcpListener::bind(addr)?;
-    eprintln!("glm serve on http://{addr}/ model {name}");
+    eprintln!("glm serve on http://{addr}/ model {name}{}", crate::serve::serve_hosts(api_key.is_some(), allowed));
     for c in l.incoming() {
         let Ok(mut c) = c else { continue };
         let _ = c.set_read_timeout(Some(std::time::Duration::from_secs(30)));
@@ -428,8 +428,8 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
             let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
         };
         let path = r.path.split('?').next().unwrap_or("");
-        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, &[]) {
-            send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
+        if path != "/health" && api_key.is_none() && !crate::serve::host_ok(&r.host, addr, allowed) {
+            send(&mut c, "403 Forbidden", "application/json", &crate::serve::host_forbidden(&r.host, addr, allowed));
             continue;
         }
         if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {

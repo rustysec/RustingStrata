@@ -110,6 +110,12 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--short N` prompts shorter than `N` tokens skip the batched prefill and go token by token (default: from
   `rustingstrata calibrate`, else 32).
 - `--allowed-hosts ai-server.lan` (or `STRATA_ALLOWED_HOSTS`) allows a LAN name when `serve` is bound to `0.0.0.0`.
+  Needed behind a proxy (llama-swap, nginx, Caddy): a proxy forwards the client's `Host`, whose name and port are the
+  proxy's, so the engine's DNS-rebinding check refuses it. Name every host the proxy can send, comma-separated; the
+  port is ignored, so `llama` covers `llama:10000`. Setting `--api-key` skips the check instead, since a rebinding page
+  has no key. A refused request answers which `Host` arrived and which names are allowed, and the server prints the
+  list when it binds — `gemma4`, `glm5-next`, `deepseek41` and `hy_v4_flash` models have their own servers and take
+  the same option.
 - `--auto-unload 600` (`serve`) frees the model after 600 seconds without a chat request: the VRAM and the memory of
   the process go back to the system, so an idle home server does not hold the GPU. The next chat request loads the
   model again with the same options and is answered after the load; the model stays in `/v1/models` meanwhile, and
