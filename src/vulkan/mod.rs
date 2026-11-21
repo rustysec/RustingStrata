@@ -1113,9 +1113,11 @@ impl Backend for Vk {
 
     fn memset(&self, dst: &Buf) -> anyhow::Result<()> {
         let mut st = self.0.st();
-        let (b, _) = st.find(dst.addr(), dst.len())?;
+        // Only `dst`, which may be a range of a larger buffer: an arena slot that "memset" itself would take the chunk
+        // it lives in with it.
+        let (b, o) = st.find(dst.addr(), dst.len())?;
         let cb = self.0.cb(&mut st)?;
-        unsafe { self.0.dev.cmd_fill_buffer(cb, b, 0, vk::WHOLE_SIZE, 0) };
+        unsafe { self.0.dev.cmd_fill_buffer(cb, b, o, dst.len() as u64, 0) };
         self.0.barrier(cb, false);
         Ok(())
     }
@@ -1133,6 +1135,9 @@ impl Backend for Vk {
         let _ = p;
         Ok((b.heap_budget[h].saturating_sub(b.heap_usage[h]) as usize, total))
     }
+
+    /// An APU's device-local heap is system RAM: the budget above is a share of memory the page cache also needs.
+    fn unified_memory(&self) -> bool { self.0.igpu }
 
     fn sync(&self) -> anyhow::Result<()> { self.0.flush(&mut self.0.st()) }
 

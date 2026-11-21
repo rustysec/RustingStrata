@@ -100,6 +100,11 @@ pub trait Backend: Send {
     fn memset(&self, dst: &Buf) -> anyhow::Result<()>;
     /// Free and total device memory in bytes.
     fn mem_info(&self) -> anyhow::Result<(usize, usize)>;
+    /// Whether "device memory" is system memory the page cache wants too: an integrated GPU (Vulkan
+    /// `INTEGRATED_GPU`, CUDA `CU_DEVICE_ATTRIBUTE_INTEGRATED`) or a CPU device. A weight uploaded there is a second
+    /// copy of bytes the model already holds in page cache, so `deepseek::mat` sizes its budget from RAM instead of
+    /// from this heap's free bytes.
+    fn unified_memory(&self) -> bool { false }
     /// Wait for all queued device work.
     fn sync(&self) -> anyhow::Result<()>;
     /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when

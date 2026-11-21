@@ -148,15 +148,20 @@ rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
 The llama.cpp numbers are from the first cold runs on this box and the RustingStrata numbers from the last runs
 before the model was deleted; they were not re-measured side by side, and both move with the page cache.
 Decode varies run to run with the page cache, because the experts that miss VRAM are read from the GGUF.
-`STRATA_DS_GPU_EXPERTS=<GB>` sets the VRAM weight budget; unset, it is 80% of free VRAM (about 9 GB on a 12 GB
-card). Prefill is one token at a time. Prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_DS_CTX` lowers it; checked against llama.cpp only up to a 1425-token prompt), decoding is greedy only, and sampling is not supported. Tool calls work in `serve`: the prompt matches the model template (jinja2 render, three cases byte for byte) and the reply's `<｜DSML｜ calls>` block is parsed, but this path has not been run against the model itself.
+`STRATA_DS_GPU_EXPERTS=<GB>` sets the VRAM weight budget, or `all` for as much as the machine can back; unset, it is 80%
+of free VRAM (about 9 GB on a 12 GB card). Experts are uploaded the first time the router picks one, so a session fills
+the cache gradually; `STRATA_DS_GPU_WARM=1` (implied by `all`) uploads them at load instead, and the load prints how much
+of the model that covers. An integrated GPU has neither memory of its own nor an unlimited table of driver objects, so
+left alone its budget is an eighth of system RAM or what the machine has free at that moment, whichever is smaller, and
+expert slots share 1 GB arenas instead of costing one buffer each (`docs/AMD.md`, "An integrated GPU refuses a command
+submission" and "The experts never all load, and decode is slow"). Prefill is one token at a time. Prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_DS_CTX` lowers it; checked against llama.cpp only up to a 1425-token prompt), decoding is greedy only, and sampling is not supported. Tool calls work in `serve`: the prompt matches the model template (jinja2 render, three cases byte for byte) and the reply's `<｜DSML｜ calls>` block is parsed, but this path has not been run against the model itself.
 
 ## GLM-5.3-Flash (UD-Q2_K_XL, 119 GB)
 
 `chat`, `generate` and `serve` detect the `glm5-next` architecture (Kimi-delta attention, sparse MLA attention, four-stream
 hyper-connections, sigmoid MoE) and run the CPU reference forward, with the dense matvecs and an expert cache on the
 CUDA card (`STRATA_DS_GPU_EXPERTS=<GB>` sets the budget, which also counts the non-expert weights; unset, it is 90% of
-free VRAM, about 10 GB on a 12 GB card). Pass the first shard.
+free VRAM, about 10 GB on a 12 GB card; an integrated GPU takes an eighth of system RAM instead — `docs/AMD.md`). Pass the first shard.
 
 ```sh
 M=GLM-5.3-Flash-UD-Q2_K_XL-00001-of-00004.gguf
@@ -175,7 +180,7 @@ decoded at 1.6 tok/s. A paired run on 2026-11-13 (64 greedy tokens through `serv
 Caveats: prefill runs 512-token chunks layer by layer so each routed expert is read once per chunk (a 380-word, about 550-token prompt prefilled in 209 s with 512-token chunks against 325 s with 128, identical logprobs; short prompts cost more per token because the experts stream from SSD once per chunk, `STRATA_GLM_CHUNK` sets the size); prompt plus reply is limited only by the model's trained context from the GGUF (1,048,576; `STRATA_GLM_CTX` lowers it, and the KV cache grows with the text, so RAM is the real bound; the k-pool sparse-attention indexer takes over past 2048 rows and was checked against llama.cpp up to 3.6k tokens: same top-5 sets, same first token); the NextN/MTP layer is unused; decoding is greedy only; tool calls work in `serve` (the prompt matches llama.cpp's template byte for byte, checked on one tool call and one tool-result round trip); the reasoning
 text comes back in `content` before `</think>`.
 
-## Hy4-flash (IQ2_S/IQ2_XXS, 85 GB)
+## Hy4-flash (IQ2_S/IQ2_XXS, 85 GB; Q4_K_M, 157 GB)
 
 `chat`, `generate`, `serve` and `bench` detect the `hy_v4_flash` architecture (four-stream hyper-connections, gated MLA
 attention with sinks, sliding-window and sparse layers, latent MoE, Engram) and run the forward in `src/hy4/`, with
@@ -187,6 +192,31 @@ rustingstrata chat     --model $M
 rustingstrata generate --model $M --prompt "The capital of France is" -n 64
 rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
 ```
+
+Both releases are split GGUFs — `M=Hy4-flash-Q4_K_M-00001-of-00002.gguf` for this one — so pass the first shard and the
+other is opened from the same directory. They differ in two ways worth knowing:
+
+* the Q4_K_M release's `block_count` (43) counts a NextN draft block, which has no hyper-connection weights and which
+  this engine does not run — it decodes trunk-only, so its layers are blocks 0..41. A file converted without a draft
+  head simply has one fewer block;
+* the Engram table `per_layer_token_embd.weight` is 63 GB in that release (96-byte rows of F8_E4M3, one byte per value)
+  and lives alone in shard 2. It is read one row at a time, so its bytes are left out of both the background preload and
+  the RAM the model is measured against (`Gguf::table_ranges`), so the ~90 GB of trunk weights can stay resident beside it.
+
+`info` prints the config that decides this, `check` reads the tensor table without reading a weight, and both take
+seconds whatever the size of the files:
+
+```sh
+STRATA_PRELOAD=0 rustingstrata info --model $M     # per-layer counts, tensor types, what stays on disk
+rustingstrata check        --model $M              # every tensor of the forward present, right dims, readable type
+```
+
+Measured 2026-11-21 on a Strix Halo box (Radeon 8060S integrated GPU, 125 GB RAM, Mesa 26.2.6, `--backend vulkan`): the
+Q4_K_M release loads and decodes greedily with 16 GB of weights on that card — 64 tokens in 29 s from a cold start with
+`STRATA_PRELOAD=0`, so the Engram table is never read ahead — held in **15 driver buffers**, because weights are carved
+out of 1 GB arenas. At one buffer per matrix the same 14 GB was ~14,000 buffers, and amdgpu refused its command
+submission with 110 GB of RAM still free (`docs/AMD.md`, "An integrated GPU refuses a command submission"). On the CPU
+(`STRATA_DS_GPU=0`) the same file decodes without any device allocation at all.
 
 The GPU is CUDA when an NVIDIA card and driver are present and Vulkan otherwise (AMD, Intel); `--backend vulkan` or
 `--backend cuda` picks one, `--device 0,1` spreads the expert cache over several cards, and `STRATA_DS_GPU=0` runs

@@ -46,6 +46,9 @@ pub struct Gpu {
     pub int8_mma: bool,
     /// sm_75: m16n8k8 mma, 64 KB of shared memory a block (no int8 mma, unlike sm_80+; unlike sm_70 it has no m8n8k4).
     turing: bool,
+    /// The device has no memory of its own (`CU_DEVICE_ATTRIBUTE_INTEGRATED`): what is uploaded here competes with the
+    /// model's page cache for system RAM. See `Backend::unified_memory`.
+    unified: bool,
     /// The device's opt-in shared memory per block (96 KB on Ampere, 64 KB on Turing).
     max_smem: u32,
     /// `argmax_rows` partials, AMAX_PARTS per row.
@@ -503,7 +506,8 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
+        let unified = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED).unwrap_or(0) == 1;
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, kv_mode, int8_mma, turing, unified, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -745,6 +749,7 @@ impl Backend for Gpu {
             kv_mode: self.kv_mode,
             int8_mma: self.int8_mma,
             turing: self.turing,
+            unified: self.unified,
             max_smem: self.max_smem,
             am,
             graphs: Default::default(),
@@ -814,6 +819,7 @@ impl Backend for Gpu {
     }
 
     fn mem_info(&self) -> anyhow::Result<(usize, usize)> { Ok(self.ctx.mem_get_info()?) }
+    fn unified_memory(&self) -> bool { self.unified }
 
     fn sync(&self) -> anyhow::Result<()> { self.wait() }
 

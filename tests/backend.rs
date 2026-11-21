@@ -169,3 +169,51 @@ fn batched_quantized_gemm_uses_prepared_x() {
         assert!(gemm(x.addr()) == want, "{backend}: GEMM used the quantization of the rows x held before");
     }
 }
+
+/// Expert slots share one device buffer (`deepseek::mat`'s arena), so every path that takes a `Buf` has to respect a
+/// sub-range: a copy, a read-back, a `memset` of one slot, and a kernel reading weights from the middle of a buffer.
+/// One allocation for three matrices is the whole point - the driver sees one object instead of one per expert, which
+/// is what a shared-memory card runs out of long before it runs out of memory.
+#[test]
+fn slots_in_one_buffer_stay_in_their_ranges() {
+    use rusting_strata::backend::{Buf, GpuTensor};
+    use rusting_strata::quant::GgmlType;
+    let (rows, cols) = (4usize, 64usize);
+    let n = rows * cols;
+    for (bk, g) in common::backends() {
+        eprintln!("backend {bk}");
+        let slot = 4 * n; // bytes, a multiple of the arena's 256-byte step
+        let arena = g.alloc(3 * slot).unwrap();
+        let at = |i: usize| Buf::new(arena.addr() + (i * slot) as u64, slot, ());
+        let want = |i: usize| -> Vec<f32> { (0..n).map(|k| (i * 100 + k) as f32).collect() };
+        for i in 0..3 { g.put(&want(i), &at(i), 0).unwrap(); }
+        for i in 0..3 {
+            assert_eq!(g.get::<f32>(&at(i), 0, n).unwrap(), want(i), "{bk}: slot {i} came back as another slot's bytes");
+        }
+
+        // A kernel writing into a slot: device-address arithmetic must land on the slot, not on its chunk.
+        let ones = g.zeros::<f32>(n).unwrap();
+        g.put(&vec![1.0f32; n], &ones, 0).unwrap();
+        g.add(at(0).addr(), ones.addr(), n).unwrap();
+        g.sync().unwrap();
+        assert_eq!(g.get::<f32>(&at(0), 0, n).unwrap(), want(0).iter().map(|v| v + 1.0).collect::<Vec<f32>>(), "{bk}: add reached outside slot 0");
+        assert_eq!(g.get::<f32>(&at(1), 0, n).unwrap(), want(1), "{bk}: a kernel on slot 0 disturbed slot 1");
+
+        g.memset(&at(1)).unwrap();
+        g.sync().unwrap();
+        assert_eq!(g.get::<f32>(&at(1), 0, n).unwrap(), vec![0.0; n], "{bk}: memset left bytes in the slot");
+        assert_eq!(g.get::<f32>(&at(2), 0, n).unwrap(), want(2), "{bk}: memset of slot 1 cleared the whole chunk");
+
+        // And a weight read from a slot: this is what an expert cache does every token.
+        let w = GpuTensor::new(GgmlType::F32, rows, cols, at(2));
+        let x = g.zeros::<f32>(cols).unwrap();
+        g.put(&vec![1.0f32; cols], &x, 0).unwrap();
+        let y = g.zeros::<f32>(rows).unwrap();
+        g.gemv(&w, x.addr(), y.addr()).unwrap();
+        let got = g.get::<f32>(&y, 0, rows).unwrap();
+        for (r, v) in got.iter().enumerate() {
+            let e: f32 = (0..cols).map(|c| (2 * 100 + r * cols + c) as f32).sum();
+            assert!(v.is_finite() && (v - e).abs() <= e.abs() * 1e-3, "{bk}: gemv of slot 2 row {r} gave {v}, expected {e}");
+        }
+    }
+}

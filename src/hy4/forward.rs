@@ -106,10 +106,34 @@ pub struct Hy4Model<'a> {
     pub trace: bool,
 }
 
-/// A table that is only read row by row: never uploaded (the Engram table is 36 GB).
+/// A table that is only read row by row: never uploaded, and not read into the page cache at start either (the Engram
+/// table is 59 GB of one-byte-per-element F8_E4M3 rows on Hy4-flash; see `Gguf::table_ranges`).
 fn host_mat<'a>(g: &'a Gguf, name: &str) -> Result<Mat<'a>> {
     let t = g.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
     Ok(Mat { data: g.bytes(t), ty: GgmlType::from_u32(t.ty)?, rows: t.dims[1] as usize, cols: t.dims[0] as usize, cpu: false, gpu: None })
+}
+
+/// Say what the GPU weight budget covers against what the model has, and with `STRATA_DS_GPU_WARM=1` (or
+/// `STRATA_DS_GPU_EXPERTS=all`) put the experts there now instead of as tokens ask for them. Unwarmed, a 90 GB expert
+/// set on a 16 GB budget uploads ~2 GB per token and never converges on a short session: the card looks like it is
+/// loading forever and every token pays for the copies it makes.
+fn experts_to_gpu(layers: &[Layer], n_expert: usize) {
+    let ex: Vec<(Mat, Mat, Mat)> = layers.iter().filter_map(|l| match &l.ffn {
+        Ffn::Moe { gexps, uexps, dexps, .. } => Some((*gexps, *uexps, *dexps)),
+        Ffn::Dense { .. } => None,
+    }).collect();
+    if ex.is_empty() || crate::deepseek::mat::dev_info().is_none() { return; }
+    let total: usize = ex.iter().map(|(g, u, d)| g.data.len() + u.data.len() + d.data.len()).sum();
+    let left = crate::deepseek::mat::budget_left();
+    eprintln!("experts: {:.1} GB of routed experts in {} MoE layers, {:.1} GB of GPU budget free: {}", total as f64 / 1e9, ex.len(), left as f64 / 1e9,
+        if left >= total { "every one of them fits".to_string() }
+        else if total > 0 && 4 * left < total { format!("{}% of the model fits; the rest is read from the mapped file whenever it is routed (raise STRATA_DS_GPU_EXPERTS, or set it to all if RAM has room)", 100 * left / total) }
+        else { format!("{}% of the model fits; the rest is read from the mapped file whenever it is routed", 100 * left / total) });
+    if !crate::deepseek::mat::warm() { return; }
+    let t0 = std::time::Instant::now();
+    let (n, bytes) = crate::deepseek::mat::warm_experts(&ex, n_expert);
+    eprintln!("warm: {n} expert matrices, {:.1} of {:.1} GB resident in {:.0} s on {} gpu buffers",
+        bytes as f64 / 1e9, total as f64 / 1e9, t0.elapsed().as_secs_f64(), crate::deepseek::mat::gpu_buffers());
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -300,12 +324,26 @@ impl<'a> Hy4Model<'a> {
                 swa: cfg.swa[il],
             });
         }
+        // The Engram lookup addresses its table by bucket, so a file with too few rows would panic in the middle of a
+        // generation; `Hy4Config::validate` checks the same bound over the whole tensor table.
+        let engram_tab = match &cfg.engram {
+            Some(en) => {
+                let tab = host_mat(g, "per_layer_token_embd.weight")?;
+                let last = en.offsets.iter().zip(&en.primes).map(|(o, p)| o + p).max().unwrap_or(0);
+                anyhow::ensure!(tab.rows as u64 >= last, "per_layer_token_embd.weight has {} rows; the Engram metadata addresses row {}", tab.rows, last);
+                Some(tab)
+            }
+            None => None,
+        };
+        // What the GPU budget actually covers, said once here: without this the only way to find out is to watch the
+        // card fill up a few megabytes per token, which reads like the model never loading at all.
+        experts_to_gpu(&layers, cfg.n_expert);
         Ok(Hy4Model {
             tok_embd: host_mat(g, "token_embd.weight")?,
             out_hc: hcw("output_hc")?,
             out_norm: vec_f32(g, "output_norm.weight")?,
             out_w: Mat::load(g, "output.weight")?,
-            engram_tab: if cfg.engram.is_some() { Some(host_mat(g, "per_layer_token_embd.weight")?) } else { None },
+            engram_tab,
             keys: vec![vec![]; cfg.n_layer],
             idx_open: vec![vec![]; cfg.n_layer],
             idx_pools: vec![vec![]; cfg.n_layer],
@@ -840,8 +878,9 @@ impl<'a> Hy4Model<'a> {
         if std::env::var_os("STRATA_DS_PROF").is_some() {
             use std::sync::atomic::Ordering::Relaxed;
             let ex = &crate::deepseek::mat::EX_LOOKUPS;
-            eprintln!("PROF pos {pos}: {:.0} ms (attn {:.0}, ffn {:.0}), expert cache hit {} miss {}, cpu share {:.2}",
-                t0.elapsed().as_secs_f64() * 1e3, t_attn * 1e3, t_ffn * 1e3, ex[0].swap(0, Relaxed), ex[1].swap(0, Relaxed), self.cpu_share.get());
+            eprintln!("PROF pos {pos}: {:.0} ms (attn {:.0}, ffn {:.0}), expert cache hit {} miss {} in {:.1} GB on {} gpu buffers, cpu share {:.2}",
+                t0.elapsed().as_secs_f64() * 1e3, t_attn * 1e3, t_ffn * 1e3, ex[0].swap(0, Relaxed), ex[1].swap(0, Relaxed),
+                crate::deepseek::mat::gpu_bytes() as f64 / 1e9, crate::deepseek::mat::gpu_buffers(), self.cpu_share.get());
         }
         logits
     }

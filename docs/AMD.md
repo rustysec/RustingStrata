@@ -51,6 +51,77 @@ The per-device times that `generate` prints on a split show whether a card is sl
 **Load fails for lack of VRAM.** The desktop on the same card takes memory, and the driver's free-memory estimate can
 be more than it will allocate. Lower `--ctx`, use `--kv q8`, or a smaller `--chunk`.
 
+**An integrated GPU refuses a command submission part way through loading a big MoE.** Two things are scarce on an APU
+and only one of them shows up in `free`, which is why this took two wrong fixes to find.
+
+*Bytes.* The device heap is a carve-out of system RAM, so a weight on the card is a second copy of bytes the model
+already holds in page cache, and sizing that cache from "80% of what the card reports free" over-commits the machine. The
+engine now sizes a shared-memory device from RAM instead (`plan` in `src/deepseek/mat.rs`): an eighth of the machine's
+size, or what the OS reports free right now less 2 GB, whichever is smaller. Whatever it settled on is printed at load
+(`GPU 0: shares system RAM with the CPU; 15.6 GB of weights on it (…)`), a matrix that no longer fits runs on the CPU, and
+once budget and mapped files no longer fit together every byte the card *has read* gives its file page back
+(`weights::upload_then_cold`; dropping the pages *before* the upload only lets the copy fault them straight back in).
+`STRATA_DS_GPU_EXPERTS=<GB>` raises the budget up to what RAM could back, free space included; `STRATA_DS_GPU_NO_CAP=1`
+removes the ceiling too.
+
+*Objects.* This is what the Hy4-flash Q4_K_M reports actually hit. Its tensor table has 555 non-expert matrices and 1.0 MB
+expert matrices, so a 14 GB expert cache is ~14000 separate device buffers and a 40 GB one ~40000 — and both runs died at
+`__radv/amdgpu: Not enough memory for command submission` with ~110 GB of the machine's RAM untouched, which no byte
+accounting explains. That message is ENOMEM from the submit ioctl, and the driver returns it when it runs out of its
+per-process table of buffer objects just as much as when it runs out of memory. So expert slots and unconverted weights
+now come out of 1 GB arenas instead of one buffer each (`Arena` in `src/deepseek/mat.rs`): a whole cache costs one driver
+object per gigabyte, and the load says so — `gpu buffers: weights come from 1024 MB arenas, ~15 buffers for a full cache`. `STRATA_DS_PROF=1` prints the live count per token, which is the number to quote if a run still fails.
+
+Neither ceiling was *measured* here until 2026-11-21, when the arena went in: the same binary then loaded Hy4-flash
+Q4_K_M and generated greedily on a Strix Halo box (125 GB RAM, Radeon 8060S, Mesa 26.2.6, another engine already holding
+38 GB of the card) at budgets of 1, 4, 8, 14 and 16 GB (and 16.8 GB left at the default, an eighth of RAM), and 64 tokens
+in 29 s wall at 16 GB — where runs on this same box and file, at 14 GB and at 40 GB, had died at the submission. What
+changed is the object count: 14 GB used to be ~14000 buffers, and became 15. So the fix is confirmed as sufficient at
+those budgets; *which* limit the old code hit is still a hypothesis, because pinning it down means driving the driver
+deliberately past a limit on a box where that costs a reboot. Ramp rather than guess big — one fresh process per step,
+stopping at the first failure, because that failure is the answer and not something to retry:
+
+```sh
+for gb in 1 2 4 8 16; do
+  STRATA_PRELOAD=0 STRATA_DS_GPU_EXPERTS=$gb STRATA_DS_PROF=1 \\
+    rustingstrata generate --model $M --backend vulkan --gpu --ctx 512 -n 8 \\
+    --prompt 'The capital of France is' 2>&1 | tail -20
+done
+```
+
+A run that fails at 1 GB is not a memory problem at all; say so in the report with the `GPU 0:`, `gpu buffers:` and `PROF`
+lines and the kernel's own words (`sudo dmesg | grep -iE 'amdgpu|gtt|oom' | tail -40` — the kernel, not Mesa, is the only
+one that knows which allocator said no). amdgpu cannot fail these calls cleanly and the card can stay unusable until
+reboot, so stop at the first such message, and close whatever else holds the card first
+(`grep -H . /sys/class/drm/card*/device/mem_info_gtt_used` says what is in use). If every step passes, bytes were the
+problem and the last one that passed is where to start. `STRATA_DS_GPU=0` needs no device allocations at all, reads
+everything straight from the mapped file, and is a working answer for this model today: the CPU forward returns the same
+greedy tokens.
+
+**"The experts never all load, and decode is slow."** They load lazily: an expert is copied to the card the first time
+the router picks it, so the cache grows a few megabytes per token and a short session never fills it. Two switches say
+what you actually want, and the load prints the arithmetic for both:
+
+```sh
+experts: 89.5 GB of routed experts in 41 MoE layers, 22.2 GB of GPU budget free: 24% of the model fits; ...
+warm: 15637 expert matrices, 22.2 of 89.5 GB resident in 15 s on 28 gpu buffers
+```
+
+* `STRATA_DS_GPU_EXPERTS=all` asks for as much as the machine can back instead of a number — on a shared-memory card
+  that is the RAM free when the model loads, less 2 GB for the run — and `STRATA_DS_GPU_WARM=1` (implied by `all`)
+  uploads the experts at load, expert 0 of every layer first, so the card is full before the first token instead of
+  after the hundredth. Expert-major on purpose: a budget that covers a quarter of the model then holds a quarter of
+  *every* layer, because a token routes across all of them.
+* Hy4-flash Q4_K_M needs **89.5 GB of experts and 7.4 GB of everything else**, so "all of them on the card" is ~97 GB of
+  pinned system RAM. On a 125 GB box that is only possible while nothing else big is running: the measurement above was
+  taken with another engine holding 74 GB, which left 29 GB, and the load line says exactly that
+  (`29.1 GB of weights on it (all this machine can back: 29 GB free of 134 RAM, …)`). Stop the other model first.
+* Warmth is worth having: at 22 GB resident, an expert-cache lookup hit 700 times per token instead of 13. But the same
+  run still decoded at 0.65-1.0 s per token, because ~550 experts a token were *not* resident and the CPU read their
+  1.5 GB from the mapped file. That is a bandwidth wall, not a knob: the only fix is more of the 89.5 GB on the card, or
+  the file in the page cache (`STRATA_PRELOAD=1`, so the CPU side reads it from RAM) with a smaller card budget. The two
+  compete for the same RAM, and the `memory:` line at load says which of them you are in.
+
 ## Switches for testing
 
 Environment variables; set any of them to turn the feature off:

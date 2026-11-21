@@ -18,9 +18,124 @@ mod dev {
     /// A tensor id holds its GPU in the top 8 bits (so STAGED, GPU 255, is never a real id) and its index there below.
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
-    struct Part { be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize }
+    /// One card's side of the device. `bytes` counts everything it holds — plain weights and expert slots together — so
+    /// that on a shared-memory device `budget` is one ceiling for both kinds (see `plan`).
+    struct Part { be: Box<dyn Backend>, ts: Vec<GpuTensor>, arena: Arena, conv: usize, x: Buf, y: Buf, stage: Buf, bytes: usize, budget: usize, room: usize, unified: bool }
     pub struct Dev { parts: Vec<Part>, ex: std::collections::HashMap<usize, usize>, exs: Vec<(u32, usize, u64, f32)>, now: u64, cur: usize, lookups: u64 }
     static DEV: OnceLock<Option<Mutex<Dev>>> = OnceLock::new();
+    /// What one GPU may hold in weights: the expert cache's budget, with the plain weights living inside that budget
+    /// (`room` is what they get before the engine moves on to the next card). A discrete card takes `frac` of its free
+    /// VRAM, or its share of `gb` when an absolute amount was asked for.
+    ///
+    /// An integrated GPU is not the same kind of memory: its device heap is system RAM, so a weight uploaded there is a
+    /// second copy of bytes the model already holds in page cache, and "80% of what the card reports free" is a share of
+    /// memory the page cache is asking for at the same time. So the budget here is a fraction of *system* RAM,
+    /// `SHARED_MEM_FRACTION`, and less still when the box has that little free at this moment — a server already holding
+    /// a model leaves a fraction of what `total_ram` says. An explicit request is clamped to what RAM could back at all,
+    /// free space included, unless `STRATA_DS_GPU_NO_CAP=1` names the risk; either way `weights::device_claim` counts the
+    /// budget with the mapped files, so an over-committed pair stops keeping two copies of every expert
+    /// (`weights::cold` drops the host copy once the upload has read it).
+    ///
+    /// Byte accounting is *not* what the Hy4-flash reports on Strix Halo hit: those runs died with ~110 GB of the
+    /// machine free, which is `Arena`'s problem, not this function's. The fraction is a conservative starting point
+    /// that has never been confirmed on that box (nothing at any budget finished there yet), not a measurement — see
+    /// docs/AMD.md for the ramp that measures it.
+    ///
+    /// Returns the budget and, when something clamped it, that ceiling (the load line says so). A `ram` of 0 means
+    /// undetectable, which leaves the request alone rather than guessing small.
+    pub(super) fn plan(f: usize, total: usize, frac: f64, gb: Option<f64>, unified: bool, ram: usize, avail: usize, uncapped: bool) -> (usize, Option<usize>) {
+        let card = |v: f64| (v * f as f64 / total.max(1) as f64) as usize;
+        // `all` on a discrete card is that card's own free heap; on a shared one it is deliberately left unbounded
+        // here, because the ceiling below is the machine's, which is the number that means something there.
+        let all = gb.is_some_and(|g| g.is_infinite());
+        let want = match gb {
+            Some(_) if all => if unified { usize::MAX } else { f.saturating_sub(56 << 20) },
+            Some(g) => card(g * 1e9),
+            None => ((f.saturating_sub(56 << 20)) as f64 * frac) as usize,
+        };
+        // With no ceiling to speak of (a discrete card, `STRATA_DS_GPU_NO_CAP`, or RAM this OS will not report), `all`
+        // means the heap the card itself offered - never `usize::MAX`, which would print an absurd budget and hand the
+        // arena an unlimited claim.
+        if !unified || uncapped || ram == 0 { return (if all { f.saturating_sub(56 << 20) } else { want }, None); }
+        // Left to itself a shared card takes `SHARED_MEM_FRACTION` of the machine. `STRATA_DS_GPU_EXPERTS=<GB>` reaches
+        // past that, up to what RAM could back at all: past where the budget and the mapped files no longer fit together
+        // (`weights::device_claim`) every byte uploaded to the card hands its file page back, so it raises how much the
+        // GPU holds rather than how much is held twice. `STRATA_DS_GPU_NO_CAP=1` removes the ceiling as well. Free space
+        // bounds an explicit request too: a card already holding another model cannot take 40 GB just because the
+        // machine has 134 GB fitted.
+        let free_cap = if avail > 0 { card(avail.saturating_sub(AVAIL_KEEP) as f64) } else { usize::MAX };
+        let cap = match gb {
+            None => card(ram as f64 * SHARED_MEM_FRACTION).min(free_cap),
+            Some(_) => card(ram.saturating_sub(AVAIL_KEEP) as f64).min(free_cap),
+        }.max(SHARED_MEM_MIN);
+        (want.min(cap), (want > cap).then_some(cap))
+    }
+
+    /// The share of system RAM an integrated GPU may take for weights. See `plan`.
+    const SHARED_MEM_FRACTION: f64 = 0.125;
+
+    /// Kept back from the machine's free RAM when a shared-memory budget is sized from it: this process's activations
+    /// and staging, and the room the OS needs to reclaim page cache without swapping.
+    pub(super) const AVAIL_KEEP: usize = 2 << 30;
+
+    /// The smallest shared-memory budget worth opening a device for: below it nearly every expert runs on the CPU
+    /// anyway, which `STRATA_DS_GPU=0` then says out loud instead of doing silently.
+    const SHARED_MEM_MIN: usize = 1 << 30;
+
+    /// Weight memory carved out of a few large device buffers rather than one per matrix, because a run's failure
+    /// tracked the *count* of buffers and not the bytes: Hy4-flash Q4_K_M has 555 non-expert matrices and 1.0 MB expert
+    /// matrices (read off its tensor table), so at one buffer each a 14 GB cache is ~14000 of them and a 40 GB one
+    /// ~40000, while both reports died with ~110 GB of the machine's RAM untouched. `Not enough memory for command
+    /// submission` is ENOMEM from the amdgpu submit ioctl, which is what the driver returns when it runs out of its
+    /// per-process objects as well as when it runs out of memory - and only the first of those is invisible in
+    /// `free`. Slots are therefore handed out of `CHUNK`-sized arenas at 256-byte steps, so an entire cache costs
+    /// `budget / CHUNK` buffers whatever the model. A chunk the driver will not allocate is its answer that the budget
+    /// is too big, and the caller falls back to the CPU instead of queueing a submission on memory that is not there.
+    /// The count this removes is the assumption it tests: if a Hy4 run still refuses submissions at 2 GB, the ceiling is
+    /// bytes or something else, and docs/AMD.md's ramp is what tells them apart.
+    struct Arena { chunk: usize, bufs: Vec<Buf>, next: u64, left: usize }
+
+    /// Where `n` bytes of a chunk-based allocator go: `Some((addr, left))` taking them from the chunk that has `left`
+    /// bytes at `next`, or `None` meaning a new chunk of `max(chunk, n)` is needed first. Pure, so the wrap can be
+    /// tested without a device.
+    pub(super) fn carve(next: u64, left: usize, n: usize) -> Option<(u64, usize)> {
+        if left < n { return None; }
+        Some((next, left - n))
+    }
+
+    impl Arena {
+        fn new(chunk: usize) -> Arena { Arena { chunk, bufs: vec![], next: 0, left: 0 } }
+        /// Device address of `n` bytes, or None when no new chunk could be allocated.
+        fn take(&mut self, be: &dyn Backend, n: usize) -> Option<u64> {
+            let n = n.next_multiple_of(256);
+            if carve(self.next, self.left, n).is_none() { self.next_chunk(be, n)?; }
+            let (a, left) = carve(self.next, self.left, n)?;
+            self.next = a + n as u64;
+            self.left = left;
+            Some(a)
+        }
+        fn next_chunk(&mut self, be: &dyn Backend, n: usize) -> Option<()> {
+            let b = be.alloc(self.chunk.max(n)).ok()?;
+            self.next = b.addr();
+            self.left = b.len();
+            self.bufs.push(b);
+            Some(())
+        }
+        fn buffers(&self) -> usize { self.bufs.len() }
+    }
+
+    /// One expert cache chunk. Small enough that the zeroing on allocate stays instant, large enough that a 40 GB
+    /// cache is 40 buffers.
+    const CHUNK: usize = 1 << 30;
+
+    /// `STRATA_DS_GPU_EXPERTS` as bytes-per-GB: a number, or `all`/`inf` for "as much as this machine can back"
+    /// (`plan`'s ceiling), which is how a whole expert set is made resident on a big integrated GPU.
+    pub(super) fn gb_asked() -> Option<f64> {
+        let v = std::env::var("STRATA_DS_GPU_EXPERTS").ok()?;
+        if v.eq_ignore_ascii_case("all") || v.eq_ignore_ascii_case("inf") { return Some(f64::INFINITY); }
+        v.parse().ok()
+    }
+
     pub fn get() -> Option<&'static Mutex<Dev>> {
         DEV.get_or_init(|| {
             // Unset or 0: every matvec runs on the CPU.
@@ -28,10 +143,11 @@ mod dev {
             let kind = std::env::var("STRATA_DS_BACKEND").ok();
             let ids: Vec<usize> = std::env::var("STRATA_DS_DEVICES").ok()
                 .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect()).filter(|v: &Vec<usize>| !v.is_empty()).unwrap_or(vec![0]);
-            // `STRATA_DS_GPU_EXPERTS` is the absolute weight budget in GB (plain weights and expert cache). Unset:
-            // `STRATA_DS_GPU_FRACTION` of free VRAM (80% by default, 90% for GLM), which keeps the old defaults on a
-            // 12 GB card and uses most of an 80 GB one.
-            let gb: Option<f64> = std::env::var("STRATA_DS_GPU_EXPERTS").ok().and_then(|v| v.parse().ok());
+            // `STRATA_DS_GPU_EXPERTS` is the absolute weight budget in GB (plain weights and expert cache), or `all` for
+            // as much as this machine can back - every expert the model has, if there is room, since the cache simply
+            // stops filling once the budget is spent. Unset: `STRATA_DS_GPU_FRACTION` of free VRAM (80% by default, 90%
+            // for GLM), which keeps the old defaults on a 12 GB card and uses most of an 80 GB one.
+            let gb: Option<f64> = gb_asked();
             let frac: f64 = std::env::var("STRATA_DS_GPU_FRACTION").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8);
             let mut bes = vec![];
             for d in ids {
@@ -42,23 +158,67 @@ mod dev {
             }
             let free: Vec<usize> = bes.iter().map(|b| b.mem_info().map_or(1, |m| m.0.max(1))).collect();
             let total: usize = free.iter().sum();
-            let parts = bes.into_iter().zip(&free).map(|(be, &f)| {
+            let uncapped = std::env::var_os("STRATA_DS_GPU_NO_CAP").is_some();
+            let ram = crate::memory::total_ram().unwrap_or(0) as usize;
+            let avail = crate::memory::available_ram().unwrap_or(0) as usize;
+            let parts = bes.into_iter().zip(&free).enumerate().map(|(i, (be, &f))| {
                 // Room for a prefill chunk of activations and outputs, so row batches reuse them instead of allocating per expert.
                 let (x, y, stage) = (be.alloc(4 * 5_000_000).ok()?, be.alloc(4 * 5_000_000).ok()?, be.alloc(STAGE).ok()?);
-                let budget = match gb {
-                    Some(g) => (g * 1e9 * f as f64 / total as f64) as usize,
-                    None => (f.saturating_sub(56 << 20) as f64 * frac) as usize,
-                };
-                // Room for the plain weights before moving on to the next GPU: what is free, less the expert cache and a margin.
-                let room = f.saturating_sub(budget + (768 << 20));
-                Some(Part { be, ts: vec![], x, y, stage, bytes: 0, budget, room })
+                let unified = be.unified_memory();
+                let (budget, capped) = plan(f, total, frac, gb, unified, ram, avail, uncapped);
+                if unified {
+                    // Which rule decided is said as plainly as the number, because it is the thing to quote in a report:
+                    // a budget that did not move when asked is a different problem from one that was capped on purpose.
+                    let all = gb.is_some_and(|g| g.is_infinite());
+                    let why = match (gb.is_some(), uncapped, capped) {
+                        (_, true, _) => format!("{:.1} GB of its heap with no ceiling (STRATA_DS_GPU_NO_CAP)", f as f64 / 1e9),
+                        (true, _, Some(c)) if all => format!("all this machine can back: {:.0} GB free of {:.0} RAM, less what the run needs for itself", c as f64 / 1e9, ram as f64 / 1e9),
+                        (true, _, Some(c)) => format!("asked for more than this machine can back; clamped to {:.0} GB", c as f64 / 1e9),
+                        (true, _, None) => "as asked (STRATA_DS_GPU_EXPERTS)".into(),
+                        (false, _, Some(_)) => "an eighth of RAM, or what is free now if less".into(),
+                        (false, _, None) => "what the heap reports free, under the ceiling".into(),
+                    };
+                    eprintln!("GPU {}: shares system RAM with the CPU; {:.1} GB of weights on it ({})", i, budget as f64 / 1e9, why);
+                }
+                // The buffer arithmetic, because it is the number that has been killing these runs and nothing else
+                // shows it: one driver object per matrix would be thousands of them for a cache this size, while an
+                // arena costs one per CHUNK whatever the model. Say which the run is using.
+                if i == 0 {
+                    eprintln!("gpu buffers: weights come from {} MB arenas, ~{} buffers for a full cache (one buffer per matrix would be thousands at this budget)",
+                        CHUNK >> 20, budget / CHUNK + 1);
+                }
+                // Room for the plain weights before moving on to the next GPU. On a discrete card that is what its own
+                // memory has left once the expert cache took its share; on a shared one `budget` *is* the ceiling, since
+                // both kinds of weight are copies of RAM and have to add up to at most that.
+                let room = if unified { budget } else { f.saturating_sub(budget + (768 << 20)) };
+                Some(Part { be, ts: vec![], arena: Arena::new(CHUNK), conv: 0, x, y, stage, bytes: 0, budget, room, unified })
             }).collect::<Option<Vec<_>>>()?;
+            // Counted with the mapped files against RAM, because on a shared-memory device they are the same pages twice.
+            let claim: usize = parts.iter().map(|p| p.budget).sum();
+            crate::weights::device_claim(claim);
+            if parts.iter().any(|p| p.unified) {
+                // The two claims and what RAM makes of them, because the symptom of getting this wrong is a wedge three
+                // lines later. "one copy" is `weights::cold` giving back each file page once the card has read it.
+                let mapped = crate::weights::mapped_bytes() as f64 / 1e9;
+                eprintln!("memory: {:.1} GB of weights on the card, {:.1} GB of mapped model files, {} RAM -> {}", claim as f64 / 1e9, mapped,
+                    match crate::memory::total_ram() { Some(r) => format!("{:.1} GB", r as f64 / 1e9), None => "unknown".into() },
+                    match (crate::weights::fits_ram(), std::env::var("STRATA_PRELOAD").ok()) {
+                        (true, _) => "both fit, file pages stay".into(),
+                        (false, Some(v)) if v != "0" => format!("one copy (forced by STRATA_PRELOAD={v})"),
+                        (false, Some(_)) => "one copy (forced off by STRATA_PRELOAD=0)".into(),
+                        (false, None) => "over RAM: one copy (an uploaded expert drops its file page)".into(),
+                    });
+            }
             Some(Mutex::new(Dev { parts, ex: Default::default(), exs: vec![], now: 0, cur: 0, lookups: 0 }))
         }).as_ref()
     }
     impl Dev {
         pub fn bytes(&self) -> usize { self.parts.iter().map(|p| p.bytes).sum() }
         pub fn info(&self) -> (&'static str, usize, usize) { (self.parts[0].be.name(), self.ex.len(), self.bytes()) }
+        /// Driver buffers the weight memory costs: one per arena chunk plus one per matrix that had to be converted on
+        /// the way up. This is the number a driver with a fixed table of buffer objects runs out of, so it is what a
+        /// report on `Not enough memory for command submission` has to quote (`STRATA_DS_PROF` prints it per token).
+        pub fn buffers(&self) -> usize { self.parts.iter().map(|p| p.arena.buffers() + p.conv).sum() }
         /// Bytes still available under the expert budget (plain weights already subtracted).
         pub fn budget_left(&self) -> usize { self.parts.iter().map(|p| p.budget.saturating_sub(p.bytes)).sum() }
         /// The GPU that takes `len` more bytes of plain weights: the current one while they fit, then the next; the last takes all.
@@ -68,15 +228,40 @@ mod dev {
         }
         pub fn upload_on(&mut self, d: usize, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
             let p = &mut self.parts[d];
-            let t = p.be.upload(&Tensor { ty, cols, rows, data }).ok()?;
+            let unified = p.unified;
+            // A weight that needs no type conversion goes into the arena: one slot per matrix is what filled the
+            // driver's table of buffer objects (`Arena`). The converted kinds (F16 as F32, Q4_0/Q5_0 as Q8_0) are host
+            // work the backend does on the way up, so they keep their own buffer.
+            let t = if crate::backend::upload_type(ty) == ty {
+                let (arena, be) = (&mut p.arena, &*p.be);
+                let a = arena.take(be, data.len())?;
+                let dst = Buf::new(a, data.len(), ());
+                be.htod(data, &dst, 0).ok()?;
+                // On a shared-memory card this copy is the second copy of bytes the file already has in page cache, so
+                // hand those pages back once the upload has read them - but only once budget and mapped files no longer
+                // fit together (`weights::cold` checks `fits_ram`, which counts this budget). One byte held in one
+                // place: from the slot now, from the file again if that slot is later overwritten or evicted.
+                if unified { crate::weights::cold(data); }
+                GpuTensor::new(ty, rows, cols, dst)
+            } else {
+                let t = crate::weights::upload_then_cold(data, unified, || p.be.upload(&Tensor { ty, cols, rows, data }).ok())?;
+                p.conv += 1;  // its own driver buffer, not an arena slot: counted in `buffers`
+                t
+            };
             p.bytes += data.len();
             p.ts.push(t);
             Some((d as u32) << SHIFT | (p.ts.len() as u32 - 1))
         }
         pub fn upload(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize) -> Option<u32> {
             let d = self.pick(data.len());
+            if !self.accepts(d, data.len()) { return None; }
             self.upload_on(d, data, ty, rows, cols)
         }
+        /// Whether the card `pick` chose may take `len` more weight bytes. A discrete card ends the chain by taking what
+        /// it is given (its memory is its own); on a shared-memory one the ceiling is system RAM for weights of every
+        /// kind, so the answer there is the budget's, and a matrix that does not fit stays on the CPU. Over-running it
+        /// is how an allocation the driver would refuse becomes a submission that wedges the card (see `plan`).
+        pub(super) fn accepts(&self, d: usize, len: usize) -> bool { !self.parts[d].unified || self.parts[d].bytes + len <= self.parts[d].room }
         fn tensor(&self, i: u32) -> &GpuTensor { &self.parts[gpu_of(i)].ts[(i & (1 << SHIFT) - 1) as usize] }
         /// VRAM copy of one routed expert: uploaded on first use while under a GPU's STRATA_DS_GPU_EXPERTS share (GB), then the
         /// least recently used slot of the same shape is overwritten. Slots touched in the last 96 lookups are kept (the
@@ -114,23 +299,40 @@ mod dev {
             if lfu && self.exs[p].3 > 4.0 { return Some(STAGED); }
             let (i, old, _, _) = self.exs[p];
             let (be, t) = (&self.parts[gpu_of(i)].be, self.tensor(i));
+            let unified = self.parts[gpu_of(i)].unified;
             if be.htod(data, &Buf::new(t.ptr, data.len(), ()), 0).is_err() { return Some(STAGED); }
+            // The new expert's pages were just read into cache by `htod`; the old slot's pages were dropped when it was
+            // uploaded. Without this the cache fills with file pages of every expert that has ever been overwritten,
+            // which is the same double claim as the first upload (and on an APU the same wedged driver).
+            if unified { crate::weights::cold(data); }
             self.ex.remove(&old);
             self.ex.insert(k, p);
             self.exs[p] = (i, k, now, 1.0);
             Some(i)
         }
+        /// A failed device call means the card is gone (an over-committed amdgpu refuses the submission and then reports
+        /// `ERROR_DEVICE_LOST`). These calls run inside rayon workers, so unwinding is not an option: a second worker
+        /// panicking mid-unwind aborts with buffers freed and submissions still in flight, which is why the process turns
+        /// into a zombie and the kernel logs "VM memory stats ... non-zero when fini" instead of releasing its GPU VM.
+        /// Exiting at once gives amdgpu its normal fini path and lets a service manager restart the job; the weights it
+        /// was computing are readable on the CPU, so the run itself is not lost - lower `STRATA_DS_GPU_EXPERTS` (see docs/AMD.md).
+        fn must<T>(r: anyhow::Result<T>) -> T {
+            match r {
+                Ok(v) => v,
+                Err(e) => { eprintln!("GPU call failed ({e}); exiting with status 1 so the driver can reset the card"); std::process::exit(1); }
+            }
+        }
         pub fn gemv(&self, i: u32, x: &[f32], y: &mut [f32], staged: Option<(&[u8], GgmlType, usize, usize)>) {
             let p = &self.parts[if i == STAGED { 0 } else { gpu_of(i) }];
-            p.be.put(x, &p.x, 0).unwrap();
+            Self::must(p.be.put(x, &p.x, 0));
             if let Some((d, ty, rows, cols)) = staged {
-                p.be.htod(d, &p.stage, 0).unwrap();
+                Self::must(p.be.htod(d, &p.stage, 0));
                 let w = GpuTensor::new(ty, rows, cols, Buf::new(p.stage.addr(), d.len(), ()));
-                p.be.gemv(&w, p.x.addr(), p.y.addr()).unwrap();
+                Self::must(p.be.gemv(&w, p.x.addr(), p.y.addr()));
             } else {
-                p.be.gemv(self.tensor(i), p.x.addr(), p.y.addr()).unwrap();
+                Self::must(p.be.gemv(self.tensor(i), p.x.addr(), p.y.addr()));
             }
-            let got: Vec<f32> = p.be.get(&p.y, 0, y.len()).unwrap();
+            let got: Vec<f32> = Self::must(p.be.get(&p.y, 0, y.len()));
             y.copy_from_slice(&got);
         }
         /// One gemv per matrix, all queued before a single readback per GPU. Job i reads x[i*xs..] (xs = 0: every
@@ -260,8 +462,45 @@ pub fn matvec_rows(m: &Mat, xs: &[&[f32]]) -> Vec<f32> {
 /// Expert cache lookups since the last PROF print: [hit, miss].
 pub static EX_LOOKUPS: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 pub fn gpu_bytes() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().bytes()) }
+/// Device buffers (arena chunks plus the odd converted upload) the weights now occupy. See `dev::Dev::buffers`.
+pub fn gpu_buffers() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().buffers()) }
 /// Expert-budget bytes not yet used (0 without a GPU).
 pub fn budget_left() -> usize { dev::get().map_or(0, |d| d.lock().unwrap().budget_left()) }
+/// `STRATA_DS_GPU_WARM=1`: fill the expert cache at load instead of one lookup at a time. Implied by
+/// `STRATA_DS_GPU_EXPERTS=all`, whose whole point is that everything is resident before the first token - and which is
+/// also the answer to "I never see the experts load": unwarmed, the cache fills as tokens route experts, so the card
+/// grows a few megabytes per token and the first hundred tokens of a session all pay for the uploads.
+pub fn warm() -> bool {
+    std::env::var("STRATA_DS_GPU_WARM").map_or(false, |v| v != "0") || dev::gb_asked().is_some_and(|g| g.is_infinite())
+}
+
+/// Fill the VRAM expert cache from a model's routed experts until the budget is spent: `layers` is one
+/// `(gate, up, down)` triple per MoE layer, `n_expert` the experts each holds. Expert-major on purpose: a budget that
+/// covers half the model then leaves half the experts of *every* layer resident rather than a few layers complete, and
+/// a token routes across all of them. Nothing is evicted (a warm-up must not cost a slot to an expert the model has not
+/// asked for), so an expert that does not fit is left exactly where it would otherwise be: read from the mapped file
+/// when it is routed. Matrices are the same size within a model, so the first one that does not fit ends the pass.
+/// Returns (matrices resident, bytes uploaded).
+pub fn warm_experts(layers: &[(Mat, Mat, Mat)], n_expert: usize) -> (usize, usize) {
+    let (t0, mut n, mut bytes, mut next) = (std::time::Instant::now(), 0usize, 0usize, 1usize << 30);
+    for e in 0..n_expert {
+        for (g, u, d) in layers {
+            for m in [g.expert_host(e, n_expert), u.expert_host(e, n_expert), d.expert_host(e, n_expert)] {
+                if dev::get().and_then(|dv| dv.lock().unwrap().expert(m.data, m.ty, m.rows, m.cols, false)).is_none() {
+                    return (n, bytes);
+                }
+                n += 1;
+                bytes += m.data.len();
+            }
+        }
+        if bytes >= next {
+            eprintln!("warm: {:.1} GB of experts resident, {n} matrices (experts 0..{} of {n_expert} in every layer), {:.0} s",
+                bytes as f64 / 1e9, e + 1, t0.elapsed().as_secs_f64());
+            next += 8 << 30;
+        }
+    }
+    (n, bytes)
+}
 /// (backend, resident expert slots, bytes of all uploaded weights) when the GPU path is open.
 pub fn dev_info() -> Option<(&'static str, usize, usize)> {
     dev::get().map(|d| d.lock().unwrap().info())
@@ -301,6 +540,8 @@ impl<'a> Mat<'a> {
             let (gr, rb) = (m.rows / n, m.ty.row_bytes(m.cols as u64));
             let mut d = d.lock().unwrap();
             let gpu = d.pick(m.data.len());  // the groups get consecutive ids on one GPU
+            // One matrix of `n` groups is `n` copies on the card: the budget says whether this machine can afford that.
+            if !d.accepts(gpu, m.data.len()) { return Ok(m); }
             let ids: Vec<_> = (0..n).map(|i| d.upload_on(gpu, &m.data[i * gr * rb..(i + 1) * gr * rb], m.ty, gr, m.cols)).collect();
             if ids.iter().all(|i| i.is_some()) { m.gpu = ids[0]; }
         }
@@ -440,4 +681,109 @@ pub fn vec_f32(g: &Gguf, name: &str) -> anyhow::Result<Vec<f32>> {
         m.row_into(r, &mut v[r * m.cols..(r + 1) * m.cols]);
     }
     Ok(v)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::dev::{AVAIL_KEEP, carve, plan};
+    const G: usize = 1 << 30;
+
+    /// Slots come out of one arena chunk at a time: an address 256-byte aligned inside the current chunk while it has
+    /// room, and None when a new chunk is needed. The point of the arena is that the number of driver buffers does not
+    /// grow with the number of experts, so this must never hand out two overlapping ranges nor skip a chunk.
+    #[test]
+    fn an_arena_carves_slots_and_wraps_to_a_new_chunk() {
+        assert_eq!(carve(0x1000, 1024, 256), Some((0x1000, 768)));
+        assert_eq!(carve(0x1000, 200, 256), None, "no room left in the chunk: the caller takes a new one");
+        assert_eq!(carve(0x1000, 0, 4096), None, "an empty chunk cannot serve a big matrix");
+        // Exactly the last bytes of a chunk, then nothing.
+        assert_eq!(carve(0x1000, 256, 256), Some((0x1000, 0)));
+        // Walked as `Arena::take` walks it: consecutive slots, one new chunk each time the previous runs out.
+        let (mut next, mut left) = (0u64, 1024usize);
+        let mut got = vec![];
+        for _ in 0..6 {
+            if carve(next, left, 256).is_none() { (next, left) = (0x8000, 1024); }
+            let (a, l) = carve(next, left, 256).unwrap();
+            got.push(a);
+            (next, left) = (a + 256, l);
+        }
+        assert_eq!(got, vec![0, 256, 512, 768, 0x8000, 0x8100], "four slots per 1 KB chunk, then the next chunk");
+    }
+
+    /// `all` (`STRATA_DS_GPU_EXPERTS=all`): as much as the machine can back on a shared card, the card's own heap on a
+    /// discrete one, and never the absurd number an unclamped infinity would cast to.
+    #[test]
+    fn all_means_what_the_machine_can_back() {
+        let inf = f64::INFINITY;
+        let ram = 125 * G;
+        // An idle box: the machine's size, less what the run needs for itself.
+        assert_eq!(plan(83 * G, 83 * G, 0.8, Some(inf), true, ram, ram, false).0, ram - AVAIL_KEEP);
+        // A box with 20 GB free cannot be asked for more than that, however the request is phrased.
+        let (b, capped) = plan(83 * G, 83 * G, 0.8, Some(inf), true, ram, 20 * G, false);
+        assert_eq!((b, capped), (20 * G - AVAIL_KEEP, Some(20 * G - AVAIL_KEEP)));
+        // A discrete card takes the heap it was offered; there is no machine ceiling to report.
+        assert_eq!(plan(24 * G, 24 * G, 0.8, Some(inf), false, ram, ram, false), (24 * G - (56 << 20), None));
+        // Even with the ceiling switched off, `all` is the heap on the table and not `usize::MAX`.
+        assert_eq!(plan(24 * G, 24 * G, 0.8, Some(inf), true, ram, ram, true).0, 24 * G - (56 << 20));
+    }
+
+    /// A discrete card keeps the old rule: `frac` of what it reports free, and an absolute request is taken as asked. Its
+    /// own memory is not RAM the page cache needs, so neither the size of the machine nor its free space comes into it.
+    #[test]
+    fn a_discrete_card_keeps_the_fraction_of_its_own_memory() {
+        let (b, capped) = plan(12 * G, 12 * G, 0.8, None, false, 32 * G, 4 * G, false);
+        assert_eq!(capped, None);
+        assert!((b as f64 - 0.8 * (12 * G - 56 * 1024 * 1024) as f64).abs() < 2.0, "{b}");
+        assert_eq!(plan(12 * G, 12 * G, 0.8, Some(9.0), false, 32 * G, 1 * G, false).0, (9e9) as usize);
+    }
+
+    /// The Strix Halo box from the report: an 82.9 GiB "free" device heap on 125 GiB of RAM, empty enough that only the
+    /// machine's size limits it. 80% of that heap (66 GB) is what over-committed it; an eighth of RAM, with Hy4-flash's
+    /// ~90 GiB of experts in page cache beside it, is what ran.
+    #[test]
+    fn a_shared_heap_is_capped_at_a_fraction_of_ram() {
+        let ram = 125 * G;
+        let (b, capped) = plan(83 * G, 83 * G, 0.8, None, true, ram, ram, false);
+        assert_eq!(capped, Some(ram / 8), "the ceiling is returned so the load line can say why the budget shrank");
+        assert_eq!(b, ram / 8);
+        assert!(b + 90 * G + 4 * G <= ram, "device copy plus the model's own pages have to fit in RAM");
+    }
+
+    /// A box already serving another model is the case that matters here: `total_ram` says 125 GiB while 20 are free.
+    /// The budget comes down to what is actually available, less what this process needs for itself (`AVAIL_KEEP`).
+    #[test]
+    fn a_busy_box_limits_it_further() {
+        let ram = 125 * G;
+        let (b, capped) = plan(83 * G, 83 * G, 0.8, None, true, ram, 8 * G, false);
+        assert_eq!(b, 8 * G - AVAIL_KEEP);
+        assert_eq!(capped, Some(8 * G - AVAIL_KEEP));
+        // With next to nothing free the floor keeps a token cache, so the card still does what it can.
+        assert_eq!(plan(83 * G, 83 * G, 0.8, None, true, ram, 1 << 30, false).0, 1 << 30);
+    }
+
+    /// Asking for more than the default eighth is what raises how much of the model sits on the card, up to what RAM can
+    /// back at all — beyond that even holding each byte once does not fit.
+    #[test]
+    fn an_explicit_budget_raises_the_default_ceiling() {
+        let ram = 125 * G;
+        // A request is not held down to the default eighth: it raises how much of the model the card holds, because
+        // past the point where budget and file pages no longer fit RAM each uploaded byte hands its page back.
+        assert_eq!(plan(83 * G, 83 * G, 0.8, Some(66.0), true, ram, ram, false).0, (66e9) as usize);
+        // But a box already holding another model cannot take it just because the machine has the memory fitted: the
+        // driver refuses the submission, so the request follows free space too.
+        let (b, capped) = plan(83 * G, 83 * G, 0.8, Some(40.0), true, ram, 16 * G, false);
+        assert_eq!((b, capped), (16 * G - AVAIL_KEEP, Some(16 * G - AVAIL_KEEP)));
+        // Up to what RAM could back at all, then: a small machine keeps the pages around its own working set.
+        let (b, capped) = plan(83 * G, 83 * G, 0.8, Some(50.0), true, 24 * G, 24 * G, false);
+        assert_eq!((b, capped), (24 * G - AVAIL_KEEP, Some(24 * G - AVAIL_KEEP)));
+        // The ceiling gone too, at the caller's own risk.
+        assert_eq!(plan(83 * G, 83 * G, 0.8, Some(50.0), true, 24 * G, 24 * G, true).0, (50e9) as usize);
+
+        // Two identical APUs split one ceiling between them by how much heap each had free.
+        let (a, c) = plan(40 * G, 80 * G, 0.8, None, true, ram, ram, false);
+        assert_eq!((a, c), (ram / 16, Some(ram / 16)));
+
+        // Without a measurable RAM size nothing is clamped: an unknown must not silently mean "no memory".
+        assert_eq!(plan(83 * G, 83 * G, 0.8, None, true, 0, 0, false).1, None);
+    }
 }
