@@ -153,3 +153,39 @@ fn f16_and_q2_0_blocks() {
     dequant_row(GgmlType::Q2_0, &blk, &mut y);
     for (j, v) in y.iter().enumerate() { assert_eq!(*v, [-0.5, 0.0, 0.5, 1.0][j % 4], "j={j}"); }
 }
+
+/// F8_E4M3 (ggml type 43), the element type of the Hy4 Engram table: one byte per value, OCP FP8 with a 4-bit
+/// exponent biased by 7, no infinities and NaN at 0x7F/0xFF. The rows are read whole (`Mat::row_into`), so getting
+/// `block_elems`/`block_bytes` wrong shifts the whole table by a byte per row.
+#[test]
+fn f8_e4m3() {
+    assert_eq!(GgmlType::from_u32(43).unwrap(), GgmlType::F8E4M3);
+    assert_eq!(GgmlType::F8E4M3.name(), "F8_E4M3");
+    assert_eq!((GgmlType::F8E4M3.block_elems(), GgmlType::F8E4M3.block_bytes()), (1, 1));
+    assert_eq!(GgmlType::F8E4M3.row_bytes(96), 96);
+    assert!(!GgmlType::F8E4M3.gpu("vulkan") && !GgmlType::F8E4M3.gpu("cuda"), "no kernel reads it: the table is a host lookup");
+
+    let cases: Vec<(u8, f32)> = vec![
+        (0x00, 0.0),
+        (0x38, 1.0),         // exp 7, man 0: (1 + 0/8) * 2^0
+        (0xB8, -1.0),
+        (0x39, 1.125),       // one mantissa step is 2^exp / 8
+        (0x3F, 1.875),
+        (0x08, 0.015625),    // exp 1: 2^-6
+        (0x7E, 448.0),       // the largest finite value: (1 + 6/8) * 2^8
+        (0x01, 1.0 / 512.0), // an exponent of 0 is a subnormal worth man/512
+        (0x07, 7.0 / 512.0),
+        (0xFF, f32::NAN),    // the sign is dropped on NaN
+    ];
+    let raw: Vec<u8> = cases.iter().map(|&(b, _)| b).collect();
+    let mut got = vec![0f32; cases.len()];
+    dequant_row(GgmlType::F8E4M3, &raw, &mut got);
+    for ((b, w), g) in cases.iter().zip(&got) {
+        if w.is_nan() { assert!(g.is_nan(), "byte {b:#04x}: {g} is not NaN"); }
+        else { assert_eq!(*g, *w, "byte {b:#04x}"); }
+    }
+    // The sign of zero survives, which is the one case a subtraction would hide.
+    let z = rusting_strata::quant::f8_e4m3_to_f32(0x80);
+    assert_eq!(z, 0.0);
+    assert!(z.is_sign_negative());
+}

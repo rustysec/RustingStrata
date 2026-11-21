@@ -275,8 +275,18 @@ pub fn will_need(p: usize, n: usize) {
     }
 }
 
-/// Bytes of the GGUF files this process has mapped now.
+/// Bytes of the GGUF files this process has mapped now, not counting their row-read tables (`Gguf::table_ranges`): the
+/// weights a token can ask for are what has to fit.
 static MAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes the GPU's weight budget will hold (`deepseek::mat::plan`, set once when the device opens). Counted with the
+/// mapped files, because on an integrated GPU a device copy and a page-cache copy are the same RAM twice; together
+/// they have to fit. A claim large enough not to is what turns `cold` back on for experts that live in VRAM.
+static DEVICE_CLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn device_claim(bytes: usize) {
+    DEVICE_CLAIMED.store(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Whether the mapped model files fit in RAM with 4 GiB to spare: then their pages stay in the page cache (`cold` is
 /// a no-op) and `preload` reads them. `STRATA_PRELOAD=0`/`1` overrides.
@@ -285,21 +295,47 @@ pub fn fits_ram() -> bool {
     match std::env::var("STRATA_PRELOAD").ok().as_deref() {
         Some("0") => false,
         Some(_) => true,
-        None => { static RAM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new(); *RAM.get_or_init(crate::memory::total_ram) }.is_some_and(|t| MAPPED.load(std::sync::atomic::Ordering::Relaxed) + (4 << 30) <= t),
+        None => { static RAM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new(); *RAM.get_or_init(crate::memory::total_ram) }.is_some_and(|t| MAPPED.load(std::sync::atomic::Ordering::Relaxed) + DEVICE_CLAIMED.load(std::sync::atomic::Ordering::Relaxed) + (4 << 30) <= t),
     }
 }
 
-/// Counts a newly mapped model file; with `read`, when the files fit in RAM (`fits_ram`), a background thread starts
+/// Counts a newly mapped model file and, with `read`, when the files fit in RAM (`fits_ram`), a background thread starts
 /// reading it into the page cache, so experts that run on the CPU do not wait for the drive on their first use
-/// (issue #49).
-pub fn preload(b: &[u8], read: bool) {
-    MAPPED.fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    let (p, n) = (b.as_ptr() as usize, b.len());
-    // The thread holds no borrow: MADV_WILLNEED on a range unmapped in the meantime fails without a fault.
+/// (issue #49). `skip` is the shard's row-read tables (`Gguf::table_ranges`, ascending by start): those bytes are neither
+/// counted nor read in, because 59 GB of Engram rows touched once at start would push out the expert pages every token
+/// reads. Returns the bytes added to the count, which `unmapped` takes off when the file closes.
+pub fn preload(b: &[u8], skip: &[(usize, usize)], read: bool) -> u64 {
+    // Everything but the tables: the bytes that should stay resident, as absolute addresses. MADV_WILLNEED on a range
+    // unmapped in the meantime fails without a fault, so the thread below holds no borrow of `b`.
+    let mut resident = vec![];
+    let (base, mut cur) = (b.as_ptr() as usize, 0usize);
+    for &(s, n) in skip {
+        let (s, e) = (s.min(b.len()), s.saturating_add(n).min(b.len()));
+        if e <= cur { continue; }  // a range already walked past, or one contained in the last
+        if s > cur { resident.push((base + cur, s - cur)); }
+        cur = e;
+    }
+    if cur < b.len() { resident.push((base + cur, b.len() - cur)); }
+    // The count is these bytes and nothing else. It used to be `b.len() - resident`, which counted the tables that were
+    // deliberately left out instead of the weights that were read in: `fits_ram` then said a 100 GB model fit anywhere,
+    // so `cold` stopped dropping the host copy of experts the card had taken and every uploaded byte was held twice -
+    // which on a shared-memory GPU is precisely the over-commit that runs the machine out of page-table memory.
+    let keep = resident.iter().map(|&(_, n)| n as u64).sum::<u64>();
+    MAPPED.fetch_add(keep, std::sync::atomic::Ordering::Relaxed);
     if read && fits_ram() {
         PRELOADING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::thread::spawn(move || { will_need(p, n); PRELOADING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); });
+        std::thread::spawn(move || {
+            for (p, n) in resident { will_need(p, n); }
+            PRELOADING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
     }
+    keep
+}
+
+/// Bytes counted as needing to stay resident: the mapped model files less their row-read tables (`preload`). Said out
+/// loud at load on a shared-memory GPU, where this and `device_claim` are two claims on one pool.
+pub fn mapped_bytes() -> u64 {
+    MAPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Takes the bytes of an unmapped model file off the count.
@@ -317,12 +353,31 @@ pub fn preloaded() -> bool {
     PRELOADING.load(std::sync::atomic::Ordering::Relaxed) == 0 && *FITS.get_or_init(fits_ram)
 }
 
+/// Upload `data`, then give its file pages back on a device that shares system RAM. The order is the point: the upload
+/// reads every byte of `data`, so `cold` before it only drops pages for the copy to fault straight back in. That leaves
+/// the GPU weights *and* their page-cache copies resident — 40 GB on the card beside 40 GB of file pages on a 134 GB
+/// box is what makes amdgpu refuse a submission. A failed upload keeps the host copy (nothing was copied yet).
+pub fn upload_then_cold<T>(data: &[u8], unified: bool, upload: impl FnOnce() -> Option<T>) -> Option<T> {
+    upload_then(unified, upload, || cold(data))
+}
+
+/// The same ordering with the release step passed in, so the order can be tested without a GPU or a page-cache policy.
+fn upload_then<T>(unified: bool, upload: impl FnOnce() -> Option<T>, release: impl FnOnce()) -> Option<T> {
+    let t = upload()?;
+    if unified { release(); }
+    Some(t)
+}
+
 /// Drops the whole pages of `b` (MADV_DONTNEED): bytes now on the GPU, whose host copy competes with the experts that
 /// missed VRAM for page cache. Expert files exceed the page cache, so pages read once at load would otherwise outlive
 /// the experts a prompt reads from it. `STRATA_COLD_KEEP` only marks them reclaimable (MADV_COLD) instead. Nothing is
-/// dropped when the model fits in RAM (`fits_ram`).
+/// dropped when the model fits in RAM (`fits_ram`). Call this *after* the last host read of `b` (`upload_then_cold`).
 pub fn cold(b: &[u8]) {
     if fits_ram() { return; }
+    cold_pages(b);
+}
+
+fn cold_pages(b: &[u8]) {
     let (a, e) = ((b.as_ptr() as usize + 4095) & !4095, (b.as_ptr() as usize + b.len()) & !4095);
     if e > a { madvise(a, e - a, if std::env::var_os("STRATA_COLD_KEEP").is_some() { 20 } else { 4 }); }
 }
@@ -356,4 +411,86 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
     for (x, y) in ca.zip(cb) { for i in 0..16 { acc[i] += x[i] * y[i]; } }
     acc.iter().sum::<f32>() + tail
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{preload, upload_then};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// What `preload` returns is what stays resident: the shard less its row-read tables. Counted the other way round,
+    /// `fits_ram` says a model that cannot fit does fit, which silences `cold` so every expert the card takes is held
+    /// twice - the over-commit an integrated GPU answers by running out of page-table memory.
+    #[test]
+    fn only_the_non_table_bytes_are_counted() {
+        let b = vec![0u8; 100];
+        assert_eq!(preload(&b, &[], false), 100);
+        assert_eq!(preload(&b, &[(10, 20)], false), 80, "a table in the middle");
+        assert_eq!(preload(&b, &[(0, 40), (60, 40)], false), 20, "tables at both ends");
+
+        // Clamped and merged: a shard whose ranges run past it must not make the count negative or double-count.
+        assert_eq!(preload(&b, &[(95, 50)], false), 95);
+        assert_eq!(preload(&b, &[(10, 30), (20, 10)], false), 70, "one range contained in the other");
+        assert_eq!(preload(&b, &[(10, 30), (10, 30)], false), 70, "the same table listed twice");
+    }
+
+    /// An upload reads the mapped bytes. Releasing the file pages before that read just lets the copy fault them back
+    /// in, so a 40 GB GPU cache sits beside 40 GB of page cache and amdgpu refuses a submission. The release must come
+    /// after the upload, and a failed upload must leave the host copy alone (the bytes may still be needed on the CPU).
+    #[test]
+    fn file_pages_are_released_after_the_upload() {
+        let released = AtomicBool::new(false);
+        let got = upload_then(true,
+            || { assert!(!released.load(Ordering::SeqCst), "pages dropped before the upload read them"); Some(7) },
+            || released.store(true, Ordering::SeqCst));
+        assert_eq!(got, Some(7));
+        assert!(released.load(Ordering::SeqCst));
+
+        let released = AtomicBool::new(false);
+        assert_eq!(upload_then::<u8>(true, || None, || released.store(true, Ordering::SeqCst)), None);
+        assert!(!released.load(Ordering::SeqCst), "a failed upload copied nothing: keep the file pages");
+
+        // A discrete card has its own memory: nothing is released there.
+        let released = AtomicBool::new(false);
+        assert_eq!(upload_then(false, || Some(1), || released.store(true, Ordering::SeqCst)), Some(1));
+        assert!(!released.load(Ordering::SeqCst));
+    }
+
+    /// The primitive behind that release, checked against the kernel rather than a spy: a mapped page faulted in by a
+    /// read is gone from this mapping after MADV_DONTNEED, so the GPU copy really is the only one left.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cold_pages_are_no_longer_resident() {
+        // mincore says whether a page is in the page cache, which MADV_DONTNEED on a shared file mapping need not evict.
+        // What matters here is this process's mapping: its RSS drops, so the card's copy is not held in this address
+        // space as well. `/proc/self/smaps` reports that per VMA.
+        fn mapped_rss(p: usize) -> usize {
+            let s = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let mut here = false;
+            for line in s.lines() {
+                if line.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) && line.contains('-') {
+                    let (a, b) = line.split_whitespace().next().unwrap().split_once('-').unwrap();
+                    let (a, b) = (usize::from_str_radix(a, 16).unwrap(), usize::from_str_radix(b, 16).unwrap());
+                    here = a <= p && p < b;
+                } else if here && line.starts_with("Rss:") {
+                    return line.split_whitespace().nth(1).unwrap().parse::<usize>().unwrap() * 1024;
+                }
+            }
+            0
+        }
+        if std::env::var_os("STRATA_COLD_KEEP").is_some() { return; } // MADV_COLD marks, it does not drop
+        let p = std::env::temp_dir().join(format!("strata-cold-{}.bin", std::process::id()));
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        f.set_len(8192).unwrap();
+        // Write real bytes: reading a hole maps the kernel's shared zero page, which mincore always calls resident.
+        use std::io::Write;
+        f.write_all(&[0x5a; 8192]).unwrap();
+        f.sync_all().unwrap(); // a dirty page cannot be dropped by MADV_DONTNEED
+        let m = unsafe { memmap2::Mmap::map(&f).unwrap() };
+        assert_eq!(m[0], 0x5a); // fault the first page in
+        assert!(mapped_rss(m.as_ptr() as usize) >= 4096, "the read populated this mapping");
+        super::cold_pages(&m);
+        assert_eq!(mapped_rss(m.as_ptr() as usize), 0, "MADV_DONTNEED left the page behind");
+        std::fs::remove_file(&p).ok();
+    }
 }

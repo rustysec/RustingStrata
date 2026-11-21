@@ -7,45 +7,59 @@ use half::{bf16, f16};
 use tables::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GgmlType { F32, F16, BF16, Q2_0, TQ1_0, TQ2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL }
+pub enum GgmlType { F32, F16, BF16, Q2_0, TQ1_0, TQ2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, F8E4M3 }
 use GgmlType::*;
 
 impl GgmlType {
     pub fn from_u32(id: u32) -> anyhow::Result<Self> {
         Ok(match id {
             0 => F32, 1 => F16, 30 => BF16, 42 => Q2_0, 34 => TQ1_0, 35 => TQ2_0, 2 => Q4_0, 3 => Q4_1, 6 => Q5_0, 7 => Q5_1, 8 => Q8_0, 10 => Q2K, 11 => Q3K, 12 => Q4K, 13 => Q5K, 14 => Q6K,
-            16 => IQ2XXS, 17 => IQ2XS, 19 => IQ1S, 29 => IQ1M, 18 => IQ3XXS, 21 => IQ3S, 22 => IQ2S, 23 => IQ4XS, 20 => IQ4NL,
+            16 => IQ2XXS, 17 => IQ2XS, 19 => IQ1S, 29 => IQ1M, 18 => IQ3XXS, 21 => IQ3S, 22 => IQ2S, 23 => IQ4XS, 20 => IQ4NL, 43 => F8E4M3,
             _ => {
                 const NAMES: [&str; 40] = ["F32", "F16", "Q4_0", "Q4_1", "", "", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K",
                     "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S",
                     "IQ2_S", "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16", "", "", "", "TQ1_0", "TQ2_0",
                     "", "", "", "MXFP4"];
                 let name = NAMES.get(id as usize).filter(|n| !n.is_empty()).unwrap_or(&"unknown");
-                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 F16 BF16 Q2_0 TQ1_0 TQ2_0 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K-Q6_K IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS")
+                anyhow::bail!("unsupported quant type {name} (ggml type id {id}); supported: F32 F16 BF16 Q2_0 TQ1_0 TQ2_0 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K-Q6_K IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS F8_E4M3")
             }
         })
     }
-    pub fn block_elems(self) -> usize { match self { F32 | F16 | BF16 => 1, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4NL => 32, Q2_0 => 64, _ => 256 } }
+    pub fn block_elems(self) -> usize { match self { F32 | F16 | BF16 | F8E4M3 => 1, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4NL => 32, Q2_0 => 64, _ => 256 } }
     pub fn block_bytes(self) -> usize {
         match self {
-            F32 => 4, F16 => 2, BF16 => 2, Q2_0 => 18, TQ1_0 => 54, TQ2_0 => 66, Q4_0 => 18, Q4_1 => 20, Q5_0 => 22, Q5_1 => 24, Q8_0 => 34, Q2K => 84, Q3K => 110, Q4K => 144, Q5K => 176, Q6K => 210,
+            F32 => 4, F16 => 2, BF16 => 2, F8E4M3 => 1, Q2_0 => 18, TQ1_0 => 54, TQ2_0 => 66, Q4_0 => 18, Q4_1 => 20, Q5_0 => 22, Q5_1 => 24, Q8_0 => 34, Q2K => 84, Q3K => 110, Q4K => 144, Q5K => 176, Q6K => 210,
             IQ1S => 50, IQ1M => 56, IQ2XXS => 66, IQ2XS => 74, IQ2S => 82, IQ3XXS => 98, IQ3S => 110, IQ4XS => 136, IQ4NL => 18,
         }
     }
     /// Backend `backend` ("cuda" or "vulkan") has kernels for this type. F16 has none: `Backend::upload` converts it to
-    /// F32, which holds its values exactly.
-    pub fn gpu(self, _backend: &str) -> bool { self != F16 }
+    /// F32, which holds its values exactly. F8_E4M3 has none and is not converted either: only the Engram table uses
+    /// it, and that is read a row at a time on the CPU.
+    pub fn gpu(self, _backend: &str) -> bool { !matches!(self, F16 | F8E4M3) }
     pub fn row_bytes(self, n: u64) -> usize { n as usize / self.block_elems() * self.block_bytes() }
     pub fn name(self) -> &'static str {
         match self {
             F32 => "F32", F16 => "F16", BF16 => "BF16", Q2_0 => "Q2_0", TQ1_0 => "TQ1_0", TQ2_0 => "TQ2_0", Q4_0 => "Q4_0", Q4_1 => "Q4_1", Q5_0 => "Q5_0", Q5_1 => "Q5_1", Q8_0 => "Q8_0", Q2K => "Q2_K", Q3K => "Q3_K", Q4K => "Q4_K",
-            Q5K => "Q5_K", Q6K => "Q6_K", IQ1S => "IQ1_S", IQ1M => "IQ1_M", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ2S => "IQ2_S", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS", IQ4NL => "IQ4_NL",
+            Q5K => "Q5_K", Q6K => "Q6_K", IQ1S => "IQ1_S", IQ1M => "IQ1_M", IQ2XXS => "IQ2_XXS", IQ2XS => "IQ2_XS", IQ2S => "IQ2_S", IQ3XXS => "IQ3_XXS", IQ3S => "IQ3_S", IQ4XS => "IQ4_XS", IQ4NL => "IQ4_NL", F8E4M3 => "F8_E4M3",
         }
     }
 }
 
 #[inline]
 fn h(b: &[u8], o: usize) -> f32 { f16::from_le_bytes([b[o], b[o + 1]]).to_f32() }
+
+/// One F8_E4M3 byte (ggml type `F8_E4M3`, the Engram table's element): OCP FP8 E4M3, exponent bias 7, no infinities.
+/// The encoding 0x7F (and its negative 0xFF) is NaN; an exponent of 0 is a subnormal worth `man`/512. llama.cpp
+/// `ggml_f8_e4m3_to_fp32`.
+#[inline]
+pub fn f8_e4m3_to_f32(x: u8) -> f32 {
+    let ax = x & 0x7F;
+    if ax == 0x7F { return f32::NAN; }
+    let (exp, man) = ((ax >> 3) & 0xF, ax & 0x7);
+    let v = if exp == 0 { f32::from(man) / 512.0 } else { f32::from_bits(((u32::from(exp) + 120) << 23) | (u32::from(man) << 20)) };
+    // The sign goes onto the value's own bits, so `-0.0` needs no branch.
+    f32::from_bits(v.to_bits() | (u32::from(x & 0x80) << 24))
+}
 
 pub(crate) fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 { (q[j] & 63, q[j + 4] & 63) }
@@ -61,6 +75,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) {
             F32 => y[0] = f32::from_le_bytes(blk.try_into().unwrap()),
             F16 => y[0] = h(blk, 0),
             BF16 => y[0] = bf16::from_le_bytes([blk[0], blk[1]]).to_f32(),
+            F8E4M3 => y[0] = f8_e4m3_to_f32(blk[0]),
             // Q2_0 (Strata/ggml type 42): f16 d, then 2-bit codes, value = (code - 1) * d.
             Q2_0 => { let d = h(blk, 0); for j in 0..64 { y[j] = (((blk[2 + j / 4] >> (2 * (j % 4))) & 3) as f32 - 1.0) * d; } }
             TQ1_0 => tq1_0(blk, y), TQ2_0 => tq2_0(blk, y),

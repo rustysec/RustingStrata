@@ -36,16 +36,50 @@ pub struct TensorInfo { pub name: String, pub dims: Vec<u64>, pub ty: u32, pub o
 pub struct Gguf {
     pub meta: BTreeMap<String, Value>,
     pub tensors: BTreeMap<String, TensorInfo>,
+    /// Bytes of the shards that are row-read tables (`table_ranges`): mapped, but kept off the page cache and out of
+    /// the RAM the model is measured against.
+    pub table_bytes: u64,
     /// Each shard's map and data offset (one entry unless the model is split).
     files: Vec<(Map, usize)>,
 }
 
-/// A mapped model file. `weights::preload` counted its bytes; unmapping takes them off the count, so a file that was
-/// opened only to read its metadata, or the model before a switch, does not make the next one look too large for RAM.
-struct Map(Mmap);
+/// A mapped model file. `weights::preload` counted its bytes — all but its row-read tables — so unmapping takes that
+/// count off again, meaning a file that was opened only to read its metadata, or the model before a switch, does not
+/// make the next one look too large for RAM.
+struct Map(Mmap, u64);
 
 impl Drop for Map {
-    fn drop(&mut self) { crate::weights::unmapped(self.0.len()); }
+    fn drop(&mut self) { crate::weights::unmapped(self.1 as usize); }
+}
+
+/// Weights that are read one row at a time rather than as a matrix, and are far too big for that to be worth holding:
+/// `per_layer_token_embd.weight`, the Engram table, which is 59 GB of 96-byte rows on Hy4-flash Q4_K_M. Every engine
+/// reads it through `Mat::row_into` (`src/hy4/forward.rs`, `src/deepseek/forward.rs`, `gpu_model::cpu_only`). Reading
+/// such a table into the page cache at start would evict the expert pages every token needs, so its bytes stay on disk
+/// and fault in per row — llama.cpp's `TENSOR_READ_LAZY` with `--lazy-mode auto`, which names this tensor and nobody
+/// else. Token embeddings are looked up by row too, but they are never this large and other paths use them as a matrix.
+const ROW_READ_TABLES: [&str; 1] = ["per_layer_token_embd.weight"];
+
+/// Below this size a table costs less to keep resident than to fault in row by row (llama.cpp's AUTO threshold).
+const ROW_READ_TABLE_BYTES: u64 = 4 << 30;
+
+/// Bytes of tensor data in the shard, from its `offset`: None for a type this project has no layout for.
+fn tensor_bytes(t: &TensorInfo) -> Option<u64> {
+    let ty = GgmlType::from_u32(t.ty).ok()?;
+    let row = u64::try_from(ty.row_bytes(t.dims.first().copied().unwrap_or(0))).ok()?;
+    t.dims.iter().skip(1).try_fold(row, |a, &d| a.checked_mul(d))
+}
+
+/// The byte range of the shard's row-read tables of at least `min` bytes, as `(start, len)` from the start of the map
+/// and sorted by start, so the caller can read everything *but* these. Empty for a file with none.
+pub fn table_ranges(tensors: &BTreeMap<String, TensorInfo>, data_offset: usize, min: u64) -> Vec<(usize, usize)> {
+    let min = usize::try_from(min).unwrap_or(usize::MAX);
+    let mut v: Vec<(usize, usize)> = ROW_READ_TABLES.iter().filter_map(|name| tensors.get(*name))
+        .filter_map(|t| Some((data_offset.checked_add(t.offset as usize)?, usize::try_from(tensor_bytes(t)?).ok()?)))
+        .filter(|&(_, n)| n >= min)
+        .collect();
+    v.sort_unstable();
+    v
 }
 
 struct Cur<'a> { b: &'a [u8], p: usize }
@@ -102,15 +136,19 @@ impl Gguf {
             for i in 1..n {
                 let mut s = Self::open_one(&path.with_file_name(format!("{stem}-{:05}-of-{n:05}.gguf", i + 1)), i, true)?;
                 g.files.append(&mut s.files);
+                g.table_bytes += std::mem::take(&mut s.table_bytes);
                 for (k, t) in std::mem::take(&mut s.tensors) { anyhow::ensure!(g.tensors.insert(k.clone(), t).is_none(), "tensor {k} in two shards"); }
             }
         }
         // The reads are queued by `weights::preload`, one call per file. Said here because nothing else shows it: the
-        // pages are not mapped into the process, so its resident size does not grow.
+        // pages are not mapped into the process, so its resident size does not grow. Row-read tables are left out of
+        // both numbers: they stay on disk and fault in a row at a time.
         #[cfg(target_os = "linux")]
         if crate::weights::fits_ram() {
-            eprintln!("page cache: reading {} MB of {} in the background (it shows as buff/cache, not as used memory)",
-                g.files.iter().map(|(m, _)| m.0.len()).sum::<usize>() >> 20, path.file_name().and_then(|s| s.to_str()).unwrap_or("the model"));
+            let read = g.files.iter().map(|(m, _)| m.0.len()).sum::<usize>().saturating_sub(g.table_bytes as usize) >> 20;
+            let tables = if g.table_bytes > 0 { format!("; {} MB of row-read tables stay on disk", g.table_bytes >> 20) } else { String::new() };
+            eprintln!("page cache: reading {read} MB of {} in the background (it shows as buff/cache, not as used memory){tables}",
+                path.file_name().and_then(|s| s.to_str()).unwrap_or("the model"));
         }
         Ok(g)
     }
@@ -129,9 +167,8 @@ impl Gguf {
         if std::env::var_os("STRATA_HUGEPAGE").is_some() {
             let _ = mmap.advise(memmap2::Advice::HugePage);
         }
-        crate::weights::preload(&mmap, read);
-        let mmap = Map(mmap);
-        let mut c = Cur { b: &mmap.0, p: 0 };
+        // The tensor table has to be read before `weights::preload` can be told which bytes not to bother with.
+        let mut c = Cur { b: &mmap, p: 0 };
         if c.take(4)? != b"GGUF" { bail!("{}: not a GGUF file", path.display()); }
         let ver = c.u32()?;
         if !(2..=3).contains(&ver) { bail!("unsupported GGUF version {ver}"); }
@@ -155,13 +192,15 @@ impl Gguf {
         let data_offset = c.p.checked_next_multiple_of(align).context("invalid GGUF alignment")?;
         // A cut-off download keeps a valid header; catch it here, not as a slice panic in `bytes`.
         for t in tensors.values() {
-            let Ok(ty) = GgmlType::from_u32(t.ty) else { continue };  // Weights::validate reports it
-            let n = t.dims.iter().skip(1).try_fold(ty.row_bytes(t.dims.first().copied().unwrap_or(0)) as u64, |a, &d| a.checked_mul(d));
-            if n.and_then(|n| n.checked_add(t.offset)).is_none_or(|e| e > (mmap.0.len() as u64).saturating_sub(data_offset as u64)) {
+            if GgmlType::from_u32(t.ty).is_err() { continue }  // Weights::validate reports it
+            let end = tensor_bytes(t).and_then(|n| n.checked_add(t.offset));
+            if end.is_none_or(|e| e > (mmap.len() as u64).saturating_sub(data_offset as u64)) {
                 bail!("{}: GGUF truncated (tensor {} lies past the end of the file; re-download it)", path.display(), t.name);
             }
         }
-        Ok(Gguf { meta, tensors, files: vec![(mmap, data_offset)] })
+        let tables = table_ranges(&tensors, data_offset, ROW_READ_TABLE_BYTES);
+        let counted = crate::weights::preload(&mmap, &tables, read);
+        Ok(Gguf { meta, tensors, table_bytes: tables.iter().map(|&(_, n)| n as u64).sum(), files: vec![(Map(mmap, counted), data_offset)] })
     }
 
     pub fn get(&self, key: &str) -> anyhow::Result<&Value> {

@@ -1459,6 +1459,7 @@ fn attn_decode_bandwidth() {
 /// | IQ3_S | 110 | `d` f16 @0 |
 /// | IQ4_XS | 136 | `d` f16 @0 |
 /// | IQ4_NL | 18 | `d` f16 @0 |
+/// | F8_E4M3 | 1 | one FP8 E4M3 byte, `& 0xFE`: 0x7F and 0xFF are that format's NaN |
 ///
 /// Every produced f32 is asserted finite, so a NaN/inf scale cannot mask a kernel bug later.
 fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
@@ -1469,6 +1470,9 @@ fn random_tensor(ty: GgmlType, rows: usize, cols: usize, seed: u32) -> Vec<u8> {
         GgmlType::F32 => (0..rows * cols).flat_map(|_| ((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         GgmlType::F16 => (0..rows * cols).flat_map(|_| half::f16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
         GgmlType::BF16 => (0..rows * cols).flat_map(|_| half::bf16::from_f32((rnd() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()).collect(),
+        // One byte per value and no scale word; `& 0xFE` keeps every byte a finite E4M3 (0x7F, 0xFF are its NaN), and
+        // a random byte is nonzero with overwhelming probability, which the caller's all-zero check needs.
+        GgmlType::F8E4M3 => (0..rows * cols).map(|_| (rnd() as u8) & 0xFE).collect(),
         _ => {
             let (bb, n) = (ty.block_bytes(), rows * (cols / ty.block_elems()));
             (0..n).flat_map(|_| {
@@ -1619,10 +1623,19 @@ fn vulkan_type_matrix() {
     let gpu: &dyn Backend = &g;
     let not_impl = |e: &anyhow::Error| format!("{e:#}").contains("not implemented");
     let types = all_types();
-    assert_eq!(types.len(), 25, "GgmlType variants");
+    assert_eq!(types.len(), 26, "GgmlType variants");
     let (rows, ne, cols, nt) = (40, 4, 256, 3);
     let mut failures = 0;
     for ty in types {
+        // Types the loader never uploads have no kernel to matrix: F16 becomes F32 on the way up, and F8_E4M3 is the
+        // Engram table's element, which is read a row at a time on the CPU (`quant::GgmlType::gpu`). Checked before the
+        // shared-memory preflight, which is about kernels this type does not have.
+        if !ty.gpu("vulkan") {
+            eprintln!("MATRIX ty={} dequant=unsupported gemv=unsupported gemvn=unsupported gemvq=unsupported moe_gemv=unsupported \
+                gemm_dense=unsupported gemm=unsupported smem=? note={}", ty.name(),
+                if ty == GgmlType::F16 { "no F16 shader path; the loader uploads it as F32" } else { "no kernel reads it: only the Engram table uses it, on the CPU" });
+            continue;
+        }
         let smem = match g.max_shared_bytes(&[ty]) {
             Ok(b) => b,
             Err(e) => { eprintln!("MATRIX ty={} dequant=fail gemv=fail gemvn=fail gemvq=fail moe_gemv=fail gemm_dense=fail gemm=fail smem=? note=preflight: {e:#}", ty.name()); failures += 1; continue; }
@@ -1630,10 +1643,6 @@ fn vulkan_type_matrix() {
         if let Err(e) = g.preflight(&[ty], true) {
             eprintln!("MATRIX ty={} dequant=fail gemv=fail gemvn=fail gemvq=fail moe_gemv=fail gemm_dense=fail gemm=fail smem={smem} note=preflight: {e:#}", ty.name());
             failures += 1;
-            continue;
-        }
-        if ty == GgmlType::F16 {
-            eprintln!("MATRIX ty={} dequant=unsupported gemv=unsupported gemvn=unsupported gemvq=unsupported moe_gemv=unsupported gemm_dense=unsupported gemm=unsupported smem={smem} note=no F16 shader path; loader uploads it as F32", ty.name());
             continue;
         }
         let (mut dequant, mut gemv, mut gemvn, mut gemvq, mut moe_gemv, mut gemm_dense, mut gemm) =

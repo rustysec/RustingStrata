@@ -1,5 +1,6 @@
 mod common;
 use rusting_strata::{config::{LayerKind, ModelConfig}, gguf::Gguf, weights::{Tensor, Weights}};
+use std::collections::BTreeMap;
 
 fn w_str(b: &mut Vec<u8>, s: &str) {
     b.extend((s.len() as u64).to_le_bytes());
@@ -312,4 +313,35 @@ fn flint_config() {
     assert_eq!(c.rope_layer, vec![false, true, true, false]);
     assert!(c.attn_sinks && c.router_sigmoid && !c.q_gate && !c.k_interleave);
     assert!(!c.is_moe_layer(0) && c.is_moe_layer(1) && c.is_moe());
+}
+
+/// The Engram table is the one tensor `weights::preload` leaves alone: read once at start, its pages would push out the
+/// expert pages every token needs. The size threshold is an argument so a table can be a few hundred bytes in a test;
+/// the shipped rule is 4 GiB, like llama.cpp's `--lazy-mode auto`.
+#[test]
+fn row_read_tables_stay_on_disk() {
+    use rusting_strata::gguf::{TensorInfo, table_ranges};
+    let ti = |name: &str, ty: u32, dims: &[u64], off: u64| TensorInfo { name: name.into(), dims: dims.to_vec(), ty, offset: off, file: 0 };
+    let file = |infos: &[TensorInfo]| -> BTreeMap<String, TensorInfo> { infos.iter().map(|t| (t.name.clone(), t.clone())).collect() };
+
+    // The Engram table of the Hy4-flash Q4_K_M release, alone in shard 2: 96 columns of F8_E4M3, one byte each. Its
+    // range starts where the data section does plus the tensor's own offset in the shard.
+    let rows = 660_006_416u64;
+    let t = file(&[ti("per_layer_token_embd.weight", 43, &[96, rows], 0)]);
+    assert_eq!(table_ranges(&t, 512, 4 << 30), vec![(512, (96 * rows) as usize)]);
+
+    // Nothing else in a shard is a table, however big: the embeddings and one Q4_K expert tensor of a real release.
+    let t = file(&[ti("token_embd.weight", 8 /* Q8_0 */, &[3072, 120832], 0),
+                   ti("blk.0.ffn_gate_exps.weight", 12, &[1536, 1536, 512], 413_934_592)]);
+    assert_eq!(table_ranges(&t, 4096, 4 << 30), vec![]);
+
+    // The same tensor under the threshold is cheaper to hold in RAM than to fault in row by row.
+    let t = file(&[ti("per_layer_token_embd.weight", 0 /* F32 */, &[96, 1024], 32)]);
+    assert_eq!(table_ranges(&t, 64, 4 << 30), vec![]);
+    assert_eq!(table_ranges(&t, 64, 8 * 96), vec![(96, 393_216)], "from 64 + 32: 1024 rows of 96 F32s");
+
+    // A tensor whose layout is unknown has no computable size, so it cannot be skipped — `Weights::validate` reports
+    // the type instead of a silently missing table.
+    let t = file(&[ti("per_layer_token_embd.weight", 9 /* Q8_1 */, &[3072, 4096], 0)]);
+    assert_eq!(table_ranges(&t, 32, 1), vec![]);
 }
