@@ -1039,13 +1039,20 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
-            println!("{:#?}", ModelConfig::from_gguf(&g)?);
+            // hy_v4_flash has no `ModelConfig`: its engine keeps its config in its own module.
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
+                println!("{:#?}", rusting_strata::hy4::Hy4Config::from_gguf(&g)?);
+            } else {
+                println!("{:#?}", ModelConfig::from_gguf(&g)?);
+            }
             let mut hist = BTreeMap::<String, usize>::new();
             for t in g.tensors.values() {
                 let name = GgmlType::from_u32(t.ty).map(|ty| ty.name().to_string()).unwrap_or(format!("type{}", t.ty));
                 *hist.entry(name).or_default() += 1;
             }
             for (ty, n) in hist { println!("{n:5} {ty}"); }
+            // The bytes `Gguf::open` left out of its preload: named tensors big enough to keep on disk.
+            if g.table_bytes > 0 { println!("{} MB of row-read tables stay on disk", g.table_bytes >> 20); }
         }
         Cmd::Score { model, input, mut engine } => {
             let text = if input == "-" {
@@ -1265,8 +1272,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Check { model, backend, device } => {
             let g = Gguf::open(&model)?;
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::hy4::ARCH) {
+                // The table check first: it reads no tensor data, so a file with the wrong set of tensors is reported
+                // in full and at once, before any weight is read into RAM or onto a GPU.
+                let c = rusting_strata::hy4::Hy4Config::from_gguf(&g)?;
+                c.validate(&g)?;
                 let m = rusting_strata::hy4::forward::Hy4Model::new(&g)?;
-                println!("check: hy_v4_flash ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                println!("check: hy_v4_flash ok: {} layers ({} blocks, {} NextN draft not run), {} experts ({} used), {} tensors, every tensor of the forward is present",
+                    m.cfg.n_layer, c.n_layer_file, c.n_nextn, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                if g.table_bytes > 0 { println!("check: {} MB read a row at a time from disk instead of being held in RAM", g.table_bytes >> 20); }
                 return Ok(());
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
