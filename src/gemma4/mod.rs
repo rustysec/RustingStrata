@@ -220,7 +220,7 @@ pub fn chat(
     let tok = crate::tokenizer::Tokenizer::from_gguf(g)?;
     let mut m = forward::Gemma4Model::new(g)?;
     let stop = stop_ids(&tok);
-    let ctx = m.cfg.n_ctx_train;
+    let ctx = crate::ctx_limit(m.cfg.n_ctx_train);
     let mut msgs: Vec<(String, String)> = system.into_iter().map(|s| ("system".to_string(), s)).collect();
     let mut first_user = true;
     loop {
@@ -277,7 +277,7 @@ pub fn serve(
     let mut m = forward::Gemma4Model::new(g)?;
     let projector = mmproj.map(crate::vision::VisionProjector::open).transpose()?;
     let stop = stop_ids(&tok);
-    let ctx = m.cfg.n_ctx_train;
+    let ctx = crate::ctx_limit(m.cfg.n_ctx_train);
     let l = std::net::TcpListener::bind(addr)?;
     eprintln!("gemma4 serve on http://{addr}/ model {name}");
     for c in l.incoming() {
@@ -293,6 +293,7 @@ pub fn serve(
             send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
             continue;
         }
+        if crate::serve::side_page(&mut c, &r.method, path, name, api_key.is_none_or(|k| crate::serve::key_ok(&r.auth, k))) { continue; }
         if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {
             send(&mut c, "401 Unauthorized", "application/json", r#"{"error":{"message":"missing or wrong API key","type":"invalid_api_key"}}"#);
             continue;

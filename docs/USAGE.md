@@ -8,7 +8,9 @@ Everything here applies to `rustingstrata chat`, `generate`, `bench` and `serve`
 `rustingstrata` with no arguments starts the server on http://127.0.0.1:8080 and opens a chat page. The page keeps chats in
 the browser, downloads models from Hugging Face (settings; `HF_TOKEN` for gated repos), switches between the
 models in the models folder (`%LOCALAPPDATA%\rusting_strata\models` on Windows, `~/.local/share/rusting_strata/models`
-elsewhere, or `serve --models-dir`), loads a `.gguf` file from any other folder by its full path (settings, models;
+elsewhere, or `serve --models-dir`) and the GGUF files that the Hugging Face cache (`~/.cache/huggingface/hub`,
+`HF_HUB_CACHE`, `HF_HOME`; `hf download` and llama.cpp `-hf`) and llama.cpp's cache (`~/.cache/llama.cpp`, `LLAMA_CACHE`)
+already hold, loads a `.gguf` file from any other folder by its full path (settings, models;
 `POST /api/load` with `"path"`, admin key only; the path is one the server sees, so in a container it is a path inside
 the container), and shows context use, speed, totals, and CPU, memory and graphics memory use of
 the server (status bar at the bottom; click it for details).
@@ -56,7 +58,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 
 ## Flags
 
-- `--ctx` KV cache size in tokens (default 4096).
+- `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution. Needs a GGUF with an MTP head (for example the Qwen3.6-35B-A3B MTP files).
   Qwen3.8-Flash-Next (`qwen4exp`) takes its head from a companion file: `--mtp-model mtp-...-shared-Q8_0.gguf`.
@@ -104,6 +106,9 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   contexts. Attention then reads rounded keys and values, so the output can differ from f16; q2 differs most.
   The head size must be a multiple of 32, and `--llama-numerics` needs the f16 cache. `calibrate` takes the
   same `--kv` value as the runs that will use it.
+- `calibrate --mtp-model PATH` or `--draft-model PATH` measures with that draft file loaded, so the chunk and the
+  expert placement see the VRAM it takes, and picks the draft count. Runs with the same `--mtp-model` or
+  `--draft-model` file use that count unless `--mtp` is given; runs with another draft file or none do not.
 - `--thinking-budget N` (`chat` and `serve`) ends the thinking block after `N` tokens by inserting `</think>`,
   so the model goes on to the answer (0, the default, is no limit). A request overrides it with
   `thinking_budget` or `chat_template_kwargs.thinking_budget` (Anthropic: `thinking.budget_tokens`).
@@ -118,6 +123,9 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   which the system takes back when it needs the memory), so the load after an unload is faster than the first one.
   The saved conversation (prompt cache) goes with the model: the first request after a load prefills its whole
   prompt. Not available for `gemma4`, `glm5-next`, `deepseek41`, `hy_v4_flash` and `inkling2_loop` models.
+- `--alias prism` (`serve`) is the model name in `/v1/models` and in the replies, whatever file is loaded (default: the
+  file name), so clients set up for `prism` keep working when another model is loaded. Calibration and the expert
+  profile stay per file.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).

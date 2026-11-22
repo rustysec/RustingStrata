@@ -335,13 +335,20 @@ __device__ __forceinline__ int pack4(int a, int b, int c, int d) { return (a & 2
 __device__ __forceinline__ u32 ldu32(const u8* p) { return *(const u32*)p; }  // 4-byte aligned only
 // kvalues_iq4nl of the 8 nibbles of q (llama.cpp's get_int_from_table_16): .x the low nibbles of its 4 bytes, .y
 // the high, in byte order. The table lives in 4 registers, so the lookups take no loads.
-__device__ __forceinline__ int2 iq4nl_lut(u32 q) {
-    const u32 t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;  // -127 .. -65, ..., 53 .. 113
+__device__ __forceinline__ int2 lut16(u32 q, u32 t0, u32 t1, u32 t2, u32 t3) {
     u32 hs = 0x32103210u | ((q & 0x88888888u) >> 1), lo = __byte_perm(t0, t1, q), hi = __byte_perm(t2, t3, q);
     u32 a = __byte_perm(lo, hi, hs);
     lo = __byte_perm(t0, t1, q >> 16); hi = __byte_perm(t2, t3, q >> 16);
     u32 b = __byte_perm(lo, hi, hs >> 16);
     return make_int2((int)__byte_perm(a, b, 0x6420), (int)__byte_perm(a, b, 0x7531));
+}
+__device__ __forceinline__ int2 iq4nl_lut(u32 q) { return lut16(q, 0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u); }  // -127 .. -65, ..., 53 .. 113
+// kvalues_fp4 (E2M1 values times 2: 0 1 2 3 4 6 8 12, then the same negated) in the same form.
+__device__ __forceinline__ int2 fp4_lut(u32 q) { return lut16(q, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu); }
+// An unsigned E4M3 scale halved (llama.cpp ggml_ue4m3_to_fp32, which pairs it with the doubled kvalues_fp4); 0x7F is 0.
+__device__ __forceinline__ float ue4m3(u32 x) {
+    u32 e = (x >> 3) & 15, m = x & 7;
+    return x == 0x7F ? 0.0f : e ? __uint_as_float((e + 119) << 23 | m << 20) : (float)m * 0x1p-10f;
 }
 // 8 bytes at 2-aligned p from the three 4-byte words that cover them, shifted when p is not 4-aligned (so the 2
 // bytes after p + 8 must be readable). No branch, so the loads of unrolled superblocks can be issued together.
@@ -604,6 +611,22 @@ template <int T> __device__ __forceinline__ void deq8_q40(const u8* b, int sub, 
 }
 template <> __device__ __forceinline__ void deq8<2>(const u8* b, int sub, float* o) { deq8_q40<2>(b, sub, o); }  // Q4_0
 template <> __device__ __forceinline__ void deq8<6>(const u8* b, int sub, float* o) { deq8_q40<6>(b, sub, o); }  // Q5_0
+template <> struct QI<40> {  // NVFP4, 4 blocks of 36: 4 UE4M3 scales (one per 16 values), then 32 bytes of codes
+    static constexpr bool MIN = false;
+    __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
+        // Values 16 s + j and 16 s + 8 + j of a block are the low and high nibbles of code byte 8 s + j.
+        const u8* p = b + 36 * (sub >> 3);
+        int s = (sub & 7) >> 1;
+        d = ue4m3(p[s]);
+        int2 a = fp4_lut(ldu32(p + 4 + 8 * s)), c = fp4_lut(ldu32(p + 8 + 8 * s));
+        lo = sub & 1 ? a.y : a.x; hi = sub & 1 ? c.y : c.x;
+    }
+};
+template <> __device__ __forceinline__ void deq8<40>(const u8* b, int sub, float* o) {
+    int lo, hi; float d, m;
+    QI<40>::get(b, sub, lo, hi, d, m);
+    for (int i = 0; i < 8; i++) o[i] = d * (float)(signed char)((i < 4 ? lo : hi) >> (8 * (i & 3)));
+}
 template <> struct QI<20> {  // IQ4_NL, 8 blocks of 18 (2-byte aligned: ld16 only)
     static constexpr bool MIN = false;
     __device__ static void get(const u8* b, int sub, int& lo, int& hi, float& d, float& m) {
@@ -811,7 +834,7 @@ __device__ __forceinline__ void gemv_row_qn(const u8* __restrict__ w, const sign
 #define FTYPES(X) X(0, f32, 1024) X(30, bf16, 512) X(144, tq2_t, 68) X(145, tqk6, 52) X(146, tqk7, 60)
 #define ITYPES(X) X(8, q8_0, 272) X(10, q2_k, 84) X(11, q3_k, 110) X(12, q4_k, 144) X(13, q5_k, 176) X(14, q6_k, 210) \
     X(19, iq1_s, 50) X(29, iq1_m, 56) X(16, iq2_xxs, 66) X(17, iq2_xs, 74) X(22, iq2_s, 82) X(18, iq3_xxs, 98) X(21, iq3_s, 110) X(23, iq4_xs, 136) X(20, iq4_nl, 144) X(42, q2_0, 72) X(34, tq1_0, 54) X(35, tq2_0, 66) X(2, q4_0, 144) X(6, q5_0, 176) \
-    X(3, q4_1, 160) X(7, q5_1, 192)
+    X(3, q4_1, 160) X(7, q5_1, 192) X(40, nvfp4, 144)
 #define QTYPES(X) FTYPES(X) ITYPES(X)
 
 #define DEF_DEQUANT(T, NAME, SBB)                                                                                 \
@@ -1625,14 +1648,180 @@ extern "C" __global__ void swiglu(float* g, const float* u, int n) {
 }
 
 // Inkling's SITU on rows of 2n floats, n gates then n ups: gate = beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb)
-// (lb not above 0: times the up as it is).
-extern "C" __global__ void situ(float* y, int n, int rows, float beta, float lb) {
+// (lb not above 0: times the up as it is). Gate and up are first multiplied by sc[row] (sc null: by 1).
+extern "C" __global__ void situ(float* y, int n, int rows, const float* sc, float beta, float lb) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * rows) return;
     float* g = y + (size_t)(i / n) * 2 * n + i % n;
-    float u = g[n];
+    float s = sc ? sc[i / n] : 1.f, gv = *g * s, u = g[n] * s;
     if (lb > 0.f) u = lb * tanhf(u / lb);
-    *g = beta * tanhf(*g / beta) / (1.f + expf(-*g)) * u;
+    *g = beta * tanhf(gv / beta) / (1.f + expf(-gv)) * u;
+}
+
+// ---- Inkling 2's decode token on the device (inkling2::device); the host math is in src/inkling2/forward.rs ----
+
+// Max over the whole block; every thread gets the result. blockDim.x must be a multiple of 32.
+__device__ float block_max(float v) {
+    __shared__ float s[32];
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    v = warp_max(v);
+    __syncthreads();
+    if (lane == 0) s[w] = v;
+    __syncthreads();
+    return warp_max(lane < nw ? s[lane] : -3.0e38f);
+}
+
+// Depth mix, one block of 256 per query row: the softmax-weighted sum of the RMS-normed states (the nb rows of
+// blocks, then cur; at most 5), scored by state . query / sqrt(n).
+extern "C" __global__ void ink_mix(const float* blocks, int nb, const float* cur, const float* q, float* out, int n) {
+    const float* qr = q + (size_t)blockIdx.x * n;
+    float sc[5], lg[5], mx = -3.0e38f, z = 0.f;
+    for (int s = 0; s <= nb; s++) {
+        const float* x = s < nb ? blocks + (size_t)s * n : cur;
+        float ss = 0.f, d = 0.f;
+        for (int i = threadIdx.x; i < n; i += 256) { ss += x[i] * x[i]; d += x[i] * qr[i]; }
+        sc[s] = 1.f / sqrtf(block_sum(ss) / (float)n + 1e-6f);
+        lg[s] = block_sum(d) * sc[s] / sqrtf((float)n);
+        mx = fmaxf(mx, lg[s]);
+    }
+    for (int s = 0; s <= nb; s++) { lg[s] = expf(lg[s] - mx); z += lg[s]; }
+    for (int i = threadIdx.x; i < n; i += 256) {
+        float o = 0.f;
+        for (int s = 0; s <= nb; s++) o += lg[s] / z * sc[s] * (s < nb ? blocks[(size_t)s * n + i] : cur[i]);
+        out[(size_t)blockIdx.x * n + i] = o;
+    }
+}
+
+// Loop controllers, the gates: block (r, j) is row r of controller j's down matrix (f16, [rank][2n]) on
+// [rms_norm(cur_j) | rms_norm(msg_j)].
+extern "C" __global__ void ink_ctrl_gate(const u16* down, const float* cur, int nins, const float* msg, float* gate, int n, int rank) {
+    int r = blockIdx.x, j = blockIdx.y;
+    const u16* w = down + ((size_t)j * rank + r) * 2 * n;
+    const float* c = cur + (size_t)min(j, nins - 1) * n;
+    const float* m = msg + (size_t)j * n;
+    float a = 0.f, b = 0.f, sa = 0.f, sb = 0.f;
+    for (int i = threadIdx.x; i < n; i += 256) {
+        a += h2f(w[i]) * c[i]; b += h2f(w[n + i]) * m[i];
+        sa += c[i] * c[i]; sb += m[i] * m[i];
+    }
+    a = block_sum(a); b = block_sum(b); sa = block_sum(sa); sb = block_sum(sb);
+    if (threadIdx.x == 0) gate[j * rank + r] = a / sqrtf(sa / (float)n + 1e-6f) + b / sqrtf(sb / (float)n + 1e-6f);
+}
+
+// Loop controllers, the update: out_j = cur_j - tanh(gate_j . forget) * cur_j + tanh(gate_j . gain) * msg_j
+// (gain and forget f16, [rank][n]).
+extern "C" __global__ void ink_ctrl_out(const u16* gain, const u16* forget, const float* gate, const float* cur, int nins, const float* msg,
+                                        float* out, int n, int rank) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
+    if (c >= n) return;
+    const u16* gw = gain + (size_t)j * rank * n + c;
+    const u16* fw = forget + (size_t)j * rank * n + c;
+    float g = 0.f, f = 0.f;
+    for (int r = 0; r < rank; r++) {
+        float t = gate[j * rank + r];
+        g += t * h2f(gw[(size_t)r * n]); f += t * h2f(fw[(size_t)r * n]);
+    }
+    float x = cur[(size_t)min(j, nins - 1) * n + c];
+    out[(size_t)j * n + c] = x - tanhf(f) * x + tanhf(g) * msg[(size_t)j * n + c];
+}
+
+// Short causal convolution with a residual (nc at most 8; out may be cur): hist holds the last nc - 1 inputs, the
+// oldest first, and is advanced by cur. taps ([c / per][lag], lag 0 the current input) may be null.
+extern "C" __global__ void ink_conv(const float* cur, const float* w, const float* taps, float* hist, float* out, int n, int nc, int per) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    float x[8], o = 0.f;
+    for (int k = 0; k + 1 < nc; k++) x[k] = hist[(size_t)k * n + c];
+    x[nc - 1] = cur[c];
+    for (int k = 0; k < nc; k++) o += x[k] * w[c * nc + k];
+    if (taps) for (int lag = 0; lag < nc; lag++) o += x[nc - 1 - lag] * taps[c / per * nc + lag];
+    out[c] = (x[nc - 1] + o) / sqrtf((float)((taps ? 2 * nc : nc) + 1));
+    for (int k = 0; k + 1 < nc; k++) hist[(size_t)k * n + c] = x[k + 1];
+}
+
+// One block of 128 per row of w values (w at most 128): times scale (may be null), then the row scaled to an L2
+// norm of at most thr, or (thr 0) to an RMS of 1; times mul. dst not null: the result also as f16.
+extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float thr, float eps, float mul, u16* dst) {
+    size_t at = (size_t)blockIdx.x * w + threadIdx.x;
+    float v = 0.f;
+    if (threadIdx.x < w) { v = x[at]; if (scale) v *= scale[at]; }
+    float ss = block_sum(v * v);
+    float f = (thr > 0.f ? fminf(thr / (sqrtf(ss) + 1e-6f), 1.f) : 1.f / sqrtf(ss / (float)w + eps)) * mul;
+    if (threadIdx.x < w) {
+        v *= f;
+        x[at] = v;
+        if (dst) dst[at] = f2h(v);
+    }
+}
+
+// Attention of one token in two launches. ink_attn: block (head, chunk) of 4 warps takes the 64 rows from chunk * 64;
+// a warp takes one row at a time. Row i of k and v (f16, nkv * hd wide) is at distance (at - i) mod rows. hd divides
+// 128. Writes (max logit, sum of exp, hd sums of exp * v) of each (head, chunk) to sc: nh * chunks * (hd + 2) floats.
+// ink_attn_merge: one block of 128 per head joins the chunks with the sink, one more logit of 0 with no value.
+extern "C" __global__ void ink_attn(const float* q, const float* r, const float* sink, const u16* k, const u16* v,
+                                    const float* bias, float* sc, int rows, int at, int nkv, int hd, int nr, int ext) {
+    __shared__ float qs[128], ps[64], acc[128];
+    int h = blockIdx.x, kh = h / (gridDim.x / nkv), kw = nkv * hd, t = threadIdx.x, lane = t & 31;
+    int i0 = blockIdx.y * 64, n = min(64, rows - i0);
+    if (t < hd) qs[t] = q[h * hd + t];
+    __syncthreads();
+    float scale = 1.f / sqrtf((float)hd);
+    for (int j = t >> 5; j < n; j += 4) {
+        int i = i0 + j, dist = at - i < 0 ? at - i + rows : at - i;
+        const u16* kr = k + (size_t)i * kw + kh * hd;
+        float d = 0.f;
+        for (int c = lane; c < hd; c += 32) d += qs[c] * h2f(kr[c]);
+        d *= scale;
+        if (dist < ext) for (int c = lane; c < nr; c += 32) d += r[h * nr + c] * bias[dist * nr + c];
+        d = warp_sum(d);
+        if (lane == 0) ps[j] = d - sink[h];
+    }
+    __syncthreads();
+    float mx = -3.0e38f;
+    for (int j = 0; j < n; j++) mx = fmaxf(mx, ps[j]);
+    __syncthreads();
+    if (t < n) ps[t] = expf(ps[t] - mx);
+    __syncthreads();
+    int c = t % hd, parts = 128 / hd;
+    float a = 0.f;
+    for (int j = t / hd; j < n; j += parts) a += ps[j] * h2f(v[(size_t)(i0 + j) * kw + kh * hd + c]);
+    acc[t] = a;
+    __syncthreads();
+    float* o = sc + ((size_t)h * gridDim.y + blockIdx.y) * (hd + 2);
+    if (t < hd) {
+        float s = 0.f;
+        for (int p = 0; p < parts; p++) s += acc[p * hd + t];
+        o[2 + t] = s;
+    }
+    if (t == 0) {
+        float z = 0.f;
+        for (int j = 0; j < n; j++) z += ps[j];
+        o[0] = mx;
+        o[1] = z;
+    }
+}
+
+extern "C" __global__ void ink_attn_merge(const float* sc, const float* gate, float* out, int chunks, int hd) {
+    int h = blockIdx.x, t = threadIdx.x;
+    const float* p = sc + (size_t)h * chunks * (hd + 2);
+    float mx = 0.f;
+    for (int j = 0; j < chunks; j++) mx = fmaxf(mx, p[j * (hd + 2)]);
+    float z = expf(-mx), o = 0.f;
+    for (int j = 0; j < chunks; j++) {
+        float e = expf(p[j * (hd + 2)] - mx);
+        z += p[j * (hd + 2) + 1] * e;
+        if (t < hd) o += p[j * (hd + 2) + 2 + t] * e;
+    }
+    if (t < hd) out[h * hd + t] = o / z * sigmoid(gate[h * hd + t]);
+}
+
+// acc = cpu + the sum of the ne rows of d (n floats each) times their weights.
+extern "C" __global__ void ink_ffn_sum(float* acc, const float* d, const float* wts, int ne, int n, const float* cpu) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    float o = cpu[c];
+    for (int e = 0; e < ne; e++) o += wts[e] * d[(size_t)e * n + c];
+    acc[c] = o;
 }
 
 // Gyro files (config::Hadamard): the routed experts read H (s x) in place of x, H the normalized Sylvester-Walsh-

@@ -78,12 +78,12 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
     Ok(())
 }
 
-/// Prompt plus reply limit per request: the model's trained context, or `STRATA_DS_CTX` tokens.
+/// Prompt plus reply limit per request: `--ctx`, else `STRATA_DS_CTX`, else the model's trained context.
 /// ponytail: only checked against llama.cpp up to a 1425-token prompt; the candidate-block prune (beyond 4096 compressed rows) is not implemented.
 fn ctx_limit(g: &Gguf) -> usize {
     let arch = g.meta.get("general.architecture").and_then(Value::as_str).unwrap_or_default();
-    std::env::var("STRATA_DS_CTX").ok().and_then(|v| v.parse().ok())
-        .or_else(|| g.meta.get(&format!("{arch}.context_length")).and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(usize::MAX)
+    crate::ctx_limit(std::env::var("STRATA_DS_CTX").ok().and_then(|v| v.parse().ok())
+        .or_else(|| g.meta.get(&format!("{arch}.context_length")).and_then(Value::as_u64).map(|v| v as usize)).unwrap_or(usize::MAX))
 }
 
 /// `rustingstrata serve` for DeepSeek: one request at a time, OpenAI `/v1/chat/completions` (JSON or SSE), `/v1/models`, `/health`.
@@ -113,6 +113,7 @@ pub fn serve(g: &Gguf, name: &str, addr: &str, api_key: Option<&str>) -> anyhow:
             send(&mut c, "403 Forbidden", "application/json", r#"{"error":{"message":"bad Host header"}}"#);
             continue;
         }
+        if crate::serve::side_page(&mut c, &r.method, path, name, api_key.is_none_or(|k| crate::serve::key_ok(&r.auth, k))) { continue; }
         if path != "/health" && api_key.is_some_and(|k| !crate::serve::key_ok(&r.auth, k)) {
             send(&mut c, "401 Unauthorized", "application/json", r#"{"error":{"message":"missing or wrong API key","type":"invalid_api_key"}}"#);
             continue;
