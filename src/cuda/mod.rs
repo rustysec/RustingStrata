@@ -13,15 +13,15 @@ use std::sync::Arc;
 
 mod nvrtc;
 
-const QTYPES: [GgmlType; 24] = {
+const QTYPES: [GgmlType; 27] = {
     use GgmlType::*;
-    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, Q4_1, Q5_1, Q4_0, Q5_0]
+    [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0]
 };
-const KERNELS: [&str; 37] = [
-    "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+const KERNELS: [&str; 39] = [
+    "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
-    "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv",
+    "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -180,6 +180,7 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
+         __device__ const float tq_lut[4096] = {{{}}};\n\
          #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define GEMM_TC {}\n\
          #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS {}\n#define GEMV_LOADW {}\n\
          #define FA_BQ {}\n#define FA_BK {}\n{}",
@@ -191,6 +192,7 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
         join(IQ3S_GRID.iter().map(|v| format!("{v:#x}u")).collect()),
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
+        join(crate::quant::TQ_LUT.iter().flatten().map(|v| format!("{v:e}f")).collect()),
         llama_numerics() as u8,
         kv_mode as u8,
         gemm_tc as u8,
@@ -358,7 +360,7 @@ fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>, carveou
 /// `gemmis_*`, 20 non-float types x 2) on a device where that code is not compiled in. Pure so a CPU test can pin
 /// both lists (282 / 242 names).
 fn kernel_names(sm80: bool) -> Vec<String> {
-    let int8 = move |&&t: &&GgmlType| sm80 && !matches!(t, GgmlType::F32 | GgmlType::BF16);
+    let int8 = move |&&t: &&GgmlType| sm80 && !t.float_x();
     KERNELS.iter().map(|s| s.to_string())
         .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
         .chain(QTYPES.iter().flat_map(|&t| ["gemv", "gemvn", "moe_gemv"].map(|p| kname(p, t) + "_p")))
@@ -443,6 +445,22 @@ macro_rules! launch {
 }
 
 fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
+
+/// The UUID of every CUDA device in CUDA's order, the order `Gpu::new` counts in: `None` for a device the driver
+/// gives none for, empty when CUDA does not load. No context is created. NVIDIA's Vulkan driver reports the same 16
+/// bytes as `deviceUUID` (NVIDIA's simpleVulkan sample picks its CUDA device by comparing the two), so `Vk::new`
+/// finds the card of a CUDA index with them.
+pub fn device_uuids() -> Vec<Option<[u8; 16]>> {
+    if !unsafe { sys::is_culib_present() } || result::init().is_err() { return vec![]; }
+    // Looked up by hand: cudarc panics on a symbol the driver lacks, and this one came with CUDA 11.4.
+    type GetUuid = unsafe extern "C" fn(*mut sys::CUuuid, sys::CUdevice) -> sys::CUresult;
+    let get = unsafe { sys::culib().get::<GetUuid>(b"cuDeviceGetUuid_v2\0") }.ok().map(|f| *f);
+    (0..result::device::get_count().unwrap_or(0)).map(|i| {
+        let mut u = sys::CUuuid { bytes: [0; 16] };
+        let ok = get.is_some_and(|f| result::device::get(i).is_ok_and(|d| unsafe { f(&mut u, d) } == sys::CUresult::CUDA_SUCCESS));
+        ok.then(|| u.bytes.map(|b| b as u8))
+    }).collect()
+}
 
 impl Gpu {
     pub fn new(device: usize) -> anyhow::Result<Gpu> {
@@ -625,7 +643,7 @@ impl Gpu {
         if Self::float_ty(ty) { 0 } else { (cols + cols / 8) as u32 }
     }
 
-    fn float_ty(ty: GgmlType) -> bool { matches!(ty, GgmlType::F32 | GgmlType::BF16) }
+    fn float_ty(ty: GgmlType) -> bool { ty.float_x() }
 
     /// Rows per warp for the integer GEMV. Experts: about 8 super-blocks of work per warp. Dense: 2 for 2048 and
     /// from 8192 rows, else 1 (measured per shape: the 4B's 2560 and 4096 rows are ~10% faster with 1, the default
@@ -1034,6 +1052,15 @@ impl Backend for Gpu {
         launch!(self, "swiglu", Self::grid(n), g, u, n as i32);
         Ok(())
     }
+    fn situ(&self, y: u64, n: usize, rows: usize, beta: f32, lb: f32) -> anyhow::Result<()> {
+        launch!(self, "situ", Self::grid(n * rows), y, n as i32, rows as i32, beta, lb);
+        Ok(())
+    }
+    fn hadamard(&self, x: u64, u: u64, s: u64, out: u64, n: usize, block: usize, rows: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(block <= 1024, "prism.hadamard.block_size {block}: at most 1024 on the GPU");
+        launch!(self, "hadamard", cfg(((rows * n / block) as u32, 1), block as u32, 0), x, u, s, out, n as i32, block as i32, 1.0 / (block as f32).sqrt());
+        Ok(())
+    }
     fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, xq: u64) -> anyhow::Result<u64> {
         launch!(self, "swiglu_q", cfg((n.div_ceil(256) as u32, rows as u32), 32, 0), g, u, n as i32, xq);
         Ok(xq)
@@ -1368,8 +1395,8 @@ mod tests {
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 306);
-        assert_eq!(sm70.len(), 262);
+        assert_eq!(sm80.len(), 335);
+        assert_eq!(sm70.len(), 291);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

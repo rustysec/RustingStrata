@@ -123,7 +123,7 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   the chat page, the model list, `/health` and the stats do not. The file stays in the page cache (`buff/cache`,
   which the system takes back when it needs the memory), so the load after an unload is faster than the first one.
   The saved conversation (prompt cache) goes with the model: the first request after a load prefills its whole
-  prompt. Not available for `gemma4`, `glm5-next`, `deepseek41` and `hy_v4_flash` models.
+  prompt. Not available for `gemma4`, `glm5-next`, `deepseek41`, `hy_v4_flash` and `inkling2_loop` models.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).
@@ -182,6 +182,10 @@ OpenCode and other agents use the OpenAI address.
 `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay resident. The
 cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP drafting is off on
 a split model.
+
+An index is the same card on both backends. NVIDIA cards are counted as CUDA counts them (by default the fastest card
+first, which is not the order of `nvidia-smi`), on Vulkan too; the other Vulkan devices follow, dedicated cards before
+integrated ones. The load prints the card of every index (`cuda device 1: ...` or `vulkan device 1: ...`).
 
 The split by free VRAM does not know which card is faster or which sits on a slow PCIe link (x1 riser, x4 slot).
 `rustingstrata calibrate --model M.gguf --device 0,1` measures it: it times prefill and decode with the split by free

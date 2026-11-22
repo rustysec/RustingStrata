@@ -419,7 +419,7 @@ mod avx2 {
                     let ls = _mm256_set_m128i(_mm_set1_epi16(2 * (sc >> 4) as i16 + 1), _mm_set1_epi16(2 * (sc & 0xF) as i16 + 1));
                     sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, ls));
                 }
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
             0.125 * hsum(acc)
         }
@@ -442,7 +442,7 @@ mod avx2 {
                     let dot = _mm256_maddubs_epi16(grid, _mm256_sign_epi8(q8, signs));
                     sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(2 * (aux >> 28) as i16 + 1)));
                 }
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
             0.25 * hsum(acc)
         }
@@ -469,7 +469,7 @@ mod avx2 {
                     let ls = 2 * (b[106 + ib / 2] >> (4 * (ib % 2)) & 0xF) as i16 + 1;
                     sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(ls)));
                 }
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
             hsum(acc)
         }
@@ -492,7 +492,7 @@ mod avx2 {
                     let ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) as i16 | ((((sh >> (2 * ib)) & 3) as i16) << 4);
                     sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(p16, _mm256_set1_epi16(ls - 32)));
                 }
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
             hsum(acc)
         }
@@ -551,7 +551,7 @@ mod avx2 {
                 let w = _mm256_set_m128i(_mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits, 4), m4)),
                                          _mm_shuffle_epi8(values, _mm_and_si128(bits, m4)));
                 let p16 = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(q8(y, o), w));
-                (_mm256_cvtepi32_ps(_mm256_madd_epi16(p16, ones)), _mm256_set1_ps(d16(b) * y.d))
+                (_mm256_cvtepi32_ps(_mm256_madd_epi16(p16, ones)), ds(b, y.d))
             };
             let mut it = row.chunks_exact(36).enumerate();
             for (i, b2) in &mut it {
@@ -571,6 +571,35 @@ mod avx2 {
         }
     }
 
+    /// `dot_iq4nl` of one row with four activations (see `super::int_dot4`).
+    pub fn dot4_iq4nl(row: &[u8], xq: [&[Q8K]; 4]) -> [f32; 4] {
+        unsafe {
+            let values = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
+            let (m4, ones) = (_mm_set1_epi8(0xF), _mm256_set1_epi16(1));
+            // Sums of the even and of the odd blocks, as the two accumulators of `dot_iq4nl`.
+            let (mut even, mut odd) = ([_mm256_setzero_ps(); 4], [_mm256_setzero_ps(); 4]);
+            let blk = |b: &[u8], i: usize, acc: &mut [__m256; 4]| {
+                let bits = _mm_loadu_si128(b.as_ptr().add(2) as *const __m128i);
+                let w = _mm256_set_m128i(_mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits, 4), m4)),
+                                         _mm_shuffle_epi8(values, _mm_and_si128(bits, m4)));
+                let aw = _mm256_sign_epi8(w, w);
+                for k in 0..4 {
+                    let y = &xq[k][i / 8];
+                    let p16 = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(q8(y, i % 8 * 32), w));
+                    acc[k] = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(_mm256_madd_epi16(p16, ones)), acc[k]);
+                }
+            };
+            let mut it = row.chunks_exact(36).enumerate();
+            for (i, b2) in &mut it {
+                blk(&b2[..18], 2 * i, &mut even);
+                blk(&b2[18..], 2 * i + 1, &mut odd);
+            }
+            let n = row.len() / 18;
+            if n % 2 == 1 { blk(&row[18 * (n - 1)..18 * n], n - 1, &mut even); }
+            std::array::from_fn(|k| hsum(_mm256_add_ps(even[k], odd[k])))
+        }
+    }
+
     /// Pair sums `p` (16 i16) times `lo` (first 8, values 0..16) and `hi` (last 8), summed into 8 i32.
     #[inline(always)]
     unsafe fn udot_scale(p: __m256i, lo: i32, hi: i32) -> __m256i { unsafe {
@@ -579,6 +608,15 @@ mod avx2 {
     /// `(w · q8)` per 16 values times `lo` (first 16) and `hi` (last 16), for 32 weights in 0..=127.
     #[inline(always)]
     unsafe fn udot32(w: __m256i, q8: __m256i, lo: i32, hi: i32) -> __m256i { unsafe { udot_scale(_mm256_maddubs_epi16(w, q8), lo, hi) } }
+    /// Eight copies of `d16(b) * d`, the same bits. A scalar f16 load compiles to `vpinsrw` into a register that the
+    /// accumulator may hold, and then each block waits for the block before it; a broadcast has no such input.
+    #[inline(always)]
+    unsafe fn ds(b: &[u8], d: f32) -> __m256 { unsafe {
+        #[cfg(target_feature = "f16c")]
+        return _mm256_mul_ps(_mm256_cvtph_ps(_mm_set1_epi16(i16::from_le_bytes([b[0], b[1]]))), _mm256_set1_ps(d));
+        #[cfg(not(target_feature = "f16c"))]
+        _mm256_set1_ps(d16(b) * d)
+    } }
     #[inline(always)]
     unsafe fn q8(y: &Q8K, i: usize) -> __m256i { unsafe { _mm256_loadu_si256(y.qs.as_ptr().add(i) as *const __m256i) } }
     #[inline(always)]
@@ -602,7 +640,7 @@ mod avx2 {
                     let dot = _mm256_maddubs_epi16(grid, _mm256_sign_epi8(q8(y, 32 * ib), _mm256_set_epi64x(s(3), s(2), s(1), s(0))));
                     sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(2 * (aux >> 28) as i16 + 1)));
                 }
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
             0.125 * hsum(acc)
         }
@@ -643,7 +681,7 @@ mod avx2 {
                     sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_shuffle_epi8(sc, sm)));
                     sm = _mm256_add_epi16(sm, sstep);
                 }
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(sumi), acc);
             }
             0.125 * hsum(acc)
         }
@@ -674,7 +712,7 @@ mod avx2 {
                 let s = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(ls, ls), bs(0)), _mm_madd_epi16(_mm_unpackhi_epi16(ls, ls), bs(1)));
                 let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
                 let s1 = _mm_cvtsi128_si32(_mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01)));
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(sumi), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(sumi), acc);
                 sumf += d16(b) * y.d * 0.125 * s1 as f32;
             }
             hsum(acc) + sumf
@@ -821,7 +859,7 @@ mod avx2 {
                     w = _mm256_or_si256(w, _mm256_and_si256(set, _mm256_set1_epi8(16)));
                 }
                 let s = _mm256_madd_epi16(_mm256_maddubs_epi16(w, q8(y, o)), ones);
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(s), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(s), acc);
                 sumf += super::q4_min(T, b) * y.d * (y.bs[o / 16] as i32 + y.bs[o / 16 + 1] as i32) as f32;
             }
             hsum(acc) + sumf
@@ -858,9 +896,26 @@ mod avx2 {
                 let (y, o) = (&xq[i / 8], i % 8 * 32);
                 let w = _mm256_loadu_si256(b[2..34].as_ptr() as *const __m256i);
                 let p = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(q8(y, o), w));
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d16(b) * y.d), _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones)), acc);
+                acc = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones)), acc);
             }
             hsum(acc)
+        }
+    }
+
+    /// `dot_q8_0` of one row with four activations (see `super::int_dot4`).
+    pub fn dot4_q8_0(row: &[u8], xq: [&[Q8K]; 4]) -> [f32; 4] {
+        unsafe {
+            let (ones, mut acc) = (_mm256_set1_epi16(1), [_mm256_setzero_ps(); 4]);
+            for (i, b) in row.chunks_exact(34).enumerate() {
+                let w = _mm256_loadu_si256(b[2..34].as_ptr() as *const __m256i);
+                let aw = _mm256_sign_epi8(w, w);
+                for k in 0..4 {
+                    let y = &xq[k][i / 8];
+                    let p = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(q8(y, i % 8 * 32), w));
+                    acc[k] = _mm256_fmadd_ps(ds(b, y.d), _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones)), acc[k]);
+                }
+            }
+            acc.map(|a| hsum(a))
         }
     }
 
@@ -1284,6 +1339,28 @@ mod avx512 {
     }
 }
 
+/// A trellis row (blocks of B bytes for 128 values, `quant::tq_points`) times x, in f32: the codebook is not on an
+/// int8 grid, so these types have no Q8_K kernel. Eight partial sums per block, where `Tensor::matvec` adds in order.
+fn dot_tq<const B: usize>(row: &[u8], x: &[f32]) -> f32 {
+    use crate::quant::{TQ_LUT as L, tq_points};
+    let mut sum = 0f32;
+    for (b, xb) in row.chunks_exact(B).zip(x.chunks_exact(128)) {
+        let (qs, mut acc) = (&b[2..B], [0f32; 8]);
+        for (t, xs) in xb.chunks_exact(8).enumerate() {
+            let ((p0, p1), (p2, p3)) = (tq_points(qs, 2 * t), tq_points(qs, 2 * t + 1));
+            let w = [L[p0][0], L[p0][1], L[p1][0], L[p1][1], L[p2][0], L[p2][1], L[p3][0], L[p3][1]];
+            for i in 0..8 { acc[i] += w[i] * xs[i]; }
+        }
+        sum += d16(b) * acc.iter().sum::<f32>();
+    }
+    sum
+}
+
+/// The f32 kernel of a type that has no integer one but is too slow through `Tensor::row`.
+pub fn float_dot(ty: GgmlType) -> Option<fn(&[u8], &[f32]) -> f32> {
+    match ty { GgmlType::TQ2T => Some(dot_tq::<34>), GgmlType::TQK6 => Some(dot_tq::<26>), GgmlType::TQK7 => Some(dot_tq::<30>), _ => None }
+}
+
 pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512vnni", target_feature = "avx512vbmi"))]
     // Opt-in: these kernels add the block sums in a different order than the AVX2 ones, so their results differ in the
@@ -1313,11 +1390,27 @@ pub fn int_dot(ty: GgmlType) -> Option<fn(&[u8], &[Q8K]) -> f32> {
     match ty { GgmlType::IQ2XS => Some(dot_iq2xs), GgmlType::IQ3XXS => Some(dot_iq3xxs), GgmlType::IQ4XS => Some(dot_iq4xs), GgmlType::IQ4NL => Some(dot_iq4nl), GgmlType::IQ3S => Some(dot_iq3s), GgmlType::Q6K => Some(dot_q6k), GgmlType::Q5K => Some(dot_q5k), GgmlType::Q8_0 => Some(dot_q8_0), GgmlType::IQ2XXS => Some(dot_iq2xxs), GgmlType::IQ2S => Some(dot_iq2s), GgmlType::IQ1S => Some(dot_iq1s), GgmlType::IQ1M => Some(dot_iq1m), GgmlType::Q2K => Some(dot_q2k), GgmlType::Q3K => Some(dot_q3k), GgmlType::Q4K => Some(dot_q4k), GgmlType::Q2_0 => Some(dot_q2_0), GgmlType::TQ1_0 => Some(dot_tq1_0), GgmlType::TQ2_0 => Some(dot_tq2_0), GgmlType::Q4_0 => Some(dot_q4::<2>), GgmlType::Q4_1 => Some(dot_q4::<3>), GgmlType::Q5_0 => Some(dot_q4::<6>), GgmlType::Q5_1 => Some(dot_q4::<7>), _ => None }
 }
 
+/// Four dots of one row at once, with the bits of `int_dot`'s kernel: the row is read and decoded once, and the
+/// four sums do not wait for each other. None where no such kernel exists; the caller then uses `int_dot`.
+pub fn int_dot4(ty: GgmlType) -> Option<fn(&[u8], [&[Q8K]; 4]) -> [f32; 4]> {
+    #[cfg(target_feature = "avx2")]
+    if std::env::var_os("STRATA_SCALAR").is_none() && std::env::var_os("STRATA_AVX512").is_none() {
+        return match ty { GgmlType::Q8_0 => Some(avx2::dot4_q8_0), GgmlType::IQ4NL => Some(avx2::dot4_iq4nl), _ => None };
+    }
+    let _ = ty;
+    None
+}
+
 /// y = t · x for every row, using the integer kernel when the type has one.
 pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
+    let rb = t.data.len() / t.rows;
+    if let Some(dot) = float_dot(t.ty) {
+        return y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+            for (k, v) in ys.iter_mut().enumerate() { let r = c * 32 + k; *v = dot(&t.data[r * rb..(r + 1) * rb], x); }
+        });
+    }
     let Some(dot) = int_dot(t.ty) else { return t.matvec(x, y) };
     let xq = quantize_q8k(x);
-    let rb = t.data.len() / t.rows;
     y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
         for (k, v) in ys.iter_mut().enumerate() {
             let r = c * 32 + k;
@@ -1330,7 +1423,7 @@ pub fn matvec(t: &Tensor, x: &[f32], y: &mut [f32]) {
 /// matrix j uses xs[j * xs.len() / mats.len()] (one x for all, or one each), so a shared x is quantized once.
 fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
     let rows = out.len() / mats.len();
-    let dot = int_dot(mats[0].ty);
+    let (dot, fdot) = (int_dot(mats[0].ty), float_dot(mats[0].ty));
     let xq: Vec<Vec<Q8K>> = if dot.is_some() { xs.iter().map(|x| quantize_q8k(x)).collect() } else { vec![] };
     // Q2_0 experts benefit from fewer Rayon tasks on AVX2. Keep enough chunks to occupy the pool,
     // including when only one expert misses; other formats keep their existing granularity.
@@ -1341,9 +1434,10 @@ fn batch_rows(mats: &[Tensor], xs: &[&[f32]], out: &mut [f32]) {
             let i = c * batch + k;
             let (t, r, x) = (&mats[i / rows], i % rows, i / rows * xs.len() / mats.len());
             let rb = t.data.len() / t.rows;
-            *v = match dot {
-                Some(d) => d(&t.data[r * rb..(r + 1) * rb], &xq[x]),
-                None => { t.row(r, buf); buf.iter().zip(xs[x]).map(|(a, b)| a * b).sum() }
+            *v = match (dot, fdot) {
+                (Some(d), _) => d(&t.data[r * rb..(r + 1) * rb], &xq[x]),
+                (_, Some(d)) => d(&t.data[r * rb..(r + 1) * rb], xs[x]),
+                _ => { t.row(r, buf); buf.iter().zip(xs[x]).map(|(a, b)| a * b).sum() }
             };
         }
     });
@@ -1360,15 +1454,20 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
     // Gate and up of every expert in one parallel pass (gate and up share a type in all supported files).
     let gu: Vec<Tensor> = sel.iter().flat_map(|&(e, _)| [gate.expert(e, n), up.expert(e, n)]).collect();
     let mut a = vec![0f32; 2 * k * ff];
+    // Gyro files: the routed experts read rotated inputs (`config::Hadamard`); the LoRA delta below reads `acts`.
+    let rot = c.hadamard.as_ref();
+    let hr = rot.map(|r| r.rotated(h));
+    let h = hr.as_deref().unwrap_or(h);
     if gate.ty == up.ty {
         batch_rows(&gu, &[h], &mut a);
     } else {
         for (i, t) in gu.iter().enumerate() { matvec(t, h, &mut a[i * ff..(i + 1) * ff]); }
     }
     let acts: Vec<Vec<f32>> = a.chunks_exact(2 * ff).map(|g| (0..ff).map(|i| ops::silu(g[i]) * g[ff + i]).collect()).collect();
+    let racts: Option<Vec<Vec<f32>>> = rot.map(|r| acts.iter().map(|a| r.rotated(a)).collect());
     let ds: Vec<Tensor> = sel.iter().map(|&(e, _)| down.expert(e, n)).collect();
     let mut o = vec![0f32; k * c.n_embd];
-    batch_rows(&ds, &acts.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
+    batch_rows(&ds, &racts.as_ref().unwrap_or(&acts).iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
     for (j, &(e, _)) in sel.iter().enumerate() {
         m.lora_delta(&format!("blk.{il}.ffn_down_exps.weight"), &acts[j], &mut o[j * c.n_embd..(j + 1) * c.n_embd], Some(e));
     }
@@ -1391,6 +1490,10 @@ pub fn experts_multi(m: &Model, il: usize, hs: &[Vec<f32>], sels: &[Vec<(usize, 
     let (gate, up, down) = (t("ffn_gate_exps.weight"), t("ffn_up_exps.weight"), t("ffn_down_exps.weight"));
     let (n, ff, k) = (c.n_expert, c.n_ff_exp, pairs.len());
     let gu: Vec<Tensor> = pairs.iter().flat_map(|&(_, e, _)| [gate.expert(e, n), up.expert(e, n)]).collect();
+    // Gyro files: the routed experts read rotated inputs (`config::Hadamard`); the LoRA delta below reads `acts`.
+    let rot = c.hadamard.as_ref();
+    let hr: Option<Vec<Vec<f32>>> = rot.map(|r| hs.iter().map(|h| r.rotated(h)).collect());
+    let hs = hr.as_deref().unwrap_or(hs);
     let xs: Vec<&[f32]> = pairs.iter().map(|&(t, ..)| hs[t].as_slice()).collect();
     let mut a = vec![0f32; 2 * k * ff];
     if gate.ty == up.ty {
@@ -1399,9 +1502,10 @@ pub fn experts_multi(m: &Model, il: usize, hs: &[Vec<f32>], sels: &[Vec<(usize, 
         for (i, t) in gu.iter().enumerate() { matvec(t, xs[i / 2], &mut a[i * ff..(i + 1) * ff]); }
     }
     let acts: Vec<Vec<f32>> = a.chunks_exact(2 * ff).map(|g| (0..ff).map(|i| ops::silu(g[i]) * g[ff + i]).collect()).collect();
+    let racts: Option<Vec<Vec<f32>>> = rot.map(|r| acts.iter().map(|a| r.rotated(a)).collect());
     let ds: Vec<Tensor> = pairs.iter().map(|&(_, e, _)| down.expert(e, n)).collect();
     let mut o = vec![0f32; k * c.n_embd];
-    batch_rows(&ds, &acts.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
+    batch_rows(&ds, &racts.as_ref().unwrap_or(&acts).iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
     for (j, (oj, &(t, e, w))) in o.chunks_exact_mut(c.n_embd).zip(&pairs).enumerate() {
         m.lora_delta(&format!("blk.{il}.ffn_down_exps.weight"), &acts[j], oj, Some(e));
         for (yy, oo) in ys[t].iter_mut().zip(oj.iter()) { *yy += w * oo; }
@@ -1412,6 +1516,23 @@ pub fn experts_multi(m: &Model, il: usize, hs: &[Vec<f32>], sels: &[Vec<(usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 4-activation kernel must give the bits of the single kernel (72 blocks, and 9: an odd count).
+    #[test]
+    fn dot4_matches_four_dots() {
+        for ty in [GgmlType::Q8_0, GgmlType::IQ4NL] {
+            let (Some(dot), Some(dot4)) = (int_dot(ty), int_dot4(ty)) else { continue };
+            for cols in [2304usize, 288] {
+                let rb = ty.row_bytes(cols as u64);
+                let mut row: Vec<u8> = (0..rb).map(|i| (i * 37 % 251) as u8).collect();
+                // A valid f16 scale in each block (1.0, 1.5, ...).
+                for (i, b) in row.chunks_exact_mut(rb / (cols / 32)).enumerate() { b[..2].copy_from_slice(&[0, 0x3C + (i % 4) as u8]); }
+                let xq: Vec<_> = (0..4).map(|t| quantize_q8k(&(0..cols).map(|i| ((i * 13 + t * 29) % 97) as f32 * 0.37 - 17.0).collect::<Vec<_>>())).collect();
+                let got = dot4(&row, [&xq[0], &xq[1], &xq[2], &xq[3]]);
+                for (g, x) in got.iter().zip(&xq) { assert_eq!(g.to_bits(), dot(&row, x).to_bits(), "{ty:?}, {cols} values"); }
+            }
+        }
+    }
 
     /// Batch boundaries can cross matrices; both Q2_0 and the f32 fallback must use the right input row.
     #[test]
@@ -1447,6 +1568,23 @@ mod tests {
                     assert_eq!(got[i * rows + r], want, "{} matrix {i} row {r}", ty.name());
                 }
             }
+        }
+    }
+
+    /// The trellis kernels equal the f32 dequantized dot on random blocks.
+    #[test]
+    fn tq_dots_match_dequant() {
+        let mut r = 0x9E3779B97F4A7C15u64;
+        let mut rnd = || { r ^= r << 13; r ^= r >> 7; r ^= r << 17; r as u8 };
+        let x: Vec<f32> = (0..640).map(|i| ((i as f32 * 0.7548777).fract() - 0.5) * 2.0).collect();
+        for ty in [GgmlType::TQ2T, GgmlType::TQK6, GgmlType::TQK7] {
+            let mut row: Vec<u8> = (0..5 * ty.block_bytes()).map(|_| rnd()).collect();
+            for b in row.chunks_exact_mut(ty.block_bytes()) { b[..2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes()); }
+            let mut w = vec![0f32; 640];
+            crate::quant::dequant_row(ty, &row, &mut w);
+            let want: f64 = w.iter().zip(&x).map(|(&a, &b)| a as f64 * b as f64).sum();
+            let got = float_dot(ty).unwrap()(&row, &x);
+            assert!(((got as f64 - want) / want.abs().max(1e-3)).abs() < 1e-5, "{}: {got} vs {want}", ty.name());
         }
     }
 

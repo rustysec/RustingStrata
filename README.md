@@ -1,7 +1,7 @@
 # RustingStrata
 
 A pure-Rust inference engine for Qwen GGUF models: Qwen3.5/3.6 (`qwen35moe`, `qwen35`), Qwen3-Next (`qwen3next`),
-Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`), GLM-5.3-Flash (`glm5-next`), Hy4-flash (`hy_v4_flash`) and Recursive Flint (`flint`). CUDA kernels are
+Qwen3.8-Flash-Next (`qwen4exp`), Qwen3 (`qwen3`, `qwen3moe`), DeepSeek-V4.1-Flash (`deepseek41`), GLM-5.3-Flash (`glm5-next`), Hy4-flash (`hy_v4_flash`), Inkling 2 Mini (`inkling2_loop`) and Recursive Flint (`flint`). CUDA kernels are
 compiled at run time with NVRTC through cudarc, and the same kernels also run on Vulkan (`--backend vulkan`): no C++
 build step, no ggml. Experts that do not fit in VRAM run on the CPU at the same time as the GPU work, and the expert
 placement adapts to the routing it sees.
@@ -76,7 +76,13 @@ Other models, greedy "The capital of France is" with `--gpu` (CUDA / Vulkan, sec
 | Qwen3.8-Flash-Next GSQ-RCO IQ2_XS (64 GB in two files, pass the `-00001-of-00002` one; 18% of experts fit in VRAM, and with 32 GB RAM the rest are partly read from disk) | Q2_0, IQ1_M to IQ4_XS, Q6_K, Q8_0, F16, BF16 | 22 / 20 tok/s |
 
 Supported GGUF types: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_0, TQ1_0, TQ2_0, Q2_K-Q6_K, IQ1_S, IQ1_M,
-IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL.
+IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, and the trellis types TQ2_T, TQK6 and TQK7 of agentionai's
+llama.cpp fork.
+
+The Gyro files of agentionai load too. Their names say TQ1_0 and TQ2_0, but the experts are stored in the trellis
+types and read inputs rotated by a Hadamard transform (`prism.hadamard.*`). `Gyro-S-TQ1_0` (TQK6, TQK7) is tested on
+CPU, CUDA and Vulkan. `Gyro-M-TQ2_0` (TQ2_T) has the same layout and only supported types, but was not run here.
+Gyro-L (TQP5 to TQP7, PTQ1_0) is not supported yet.
 
 ## Build
 
@@ -258,6 +264,52 @@ with the adaptive split and with chunked prefill the greedy text can differ from
 token-by-token prefill give the same logits within 1e-3 on the CPU path. `tests/hy4_forward.rs` runs when
 `STRATA_HY4_MODEL` points at the first shard.
 
+## Inkling 2 Mini (IQ4_NL, 17.6 GB)
+
+`chat`, `generate`, `serve` and `bench` detect the `inkling2_loop` architecture (Thinking Machines Inkling 2: 24
+layers of which layers 6-17 run three times with message controllers between the passes, so a token is 48 layer runs;
+sliding-window attention with a relative bias and sinks, full attention on every sixth layer; 128 experts, 8 used) and
+run the forward in `src/inkling2/`, with the matvecs and an expert cache on the GPU (no `--gpu` flag needed).
+
+```sh
+M=Inkling-2-Mini-IQ4_NL.gguf
+rustingstrata chat     --model $M
+rustingstrata generate --model $M --prompt "The capital of France is" -n 64
+rustingstrata serve    --model $M --addr 127.0.0.1:8080 [--api-key K]
+```
+
+The backend, device and expert options are those of Hy4-flash above: CUDA when an NVIDIA card and driver are present
+and Vulkan otherwise, `--backend vulkan` or `--backend cuda` to pick one, `STRATA_DS_GPU=0` for the CPU only, and
+`--fixed-experts` for the same text on every run. The prompt runs layer by layer in chunks of `STRATA_DS_CHUNK` tokens
+(default 512). The weights take `STRATA_DS_GPU_FRACTION` of the free VRAM (default 0.8); the experts that do not fit
+run on the CPU.
+
+On an RTX 3060 12 GB with 30 GB RAM and a Ryzen 5 7600X, `bench --pp 64,512,2048 --tg 64 --reps 2` measured (mean of
+the two runs, and the two runs):
+
+| Backend | Prefill 64 / 512 / 2048 tokens (tok/s) | Decode after them (tok/s) |
+|---|---|---|
+| CUDA | 120.7 (59.2, 182.2) / 259.2 (254.6, 263.9) / 220.2 (218.7, 221.8) | 29.9 / 27.1 / 25.6 |
+| Vulkan (same card) | 82.7 (34.5, 130.9) / 226.9 (226.6, 227.1) / 182.6 (179.0, 186.2) | 21.5 / 20.9 / 19.8 |
+| CPU only (`STRATA_DS_GPU=0`) | 47.5 / 49.8 / 48.2 | 12.0 / 11.6 / 11.3 |
+
+The first run of the 64-token prompt is the first work of the process and is the slow one of the two.
+llama.cpp c622f62 built with CUDA, in the same session (`llama-bench -t 6 -r 2`; `-ngl 99` runs out of VRAM):
+with `-ngl 18` prefill 124.7 / 383.9 / 322.6 tok/s and decode 8.7 tok/s, with `-ngl 0` prefill 122.3 / 377.5 tok/s
+(64 / 512) and decode 10.5 tok/s. So on this box the prompt is read at 0.6-0.7 of llama.cpp's speed from 512 tokens
+on, and the reply is written 2.4-3.4 times as fast. `llama-bench` decodes from an empty context and `bench` decodes
+after the prompt. More in [BENCHMARKS.md](docs/BENCHMARKS.md#inkling-2-mini-iq4_nl-176-gb).
+Not measured: an AMD or Intel card (the Vulkan path was run on the RTX 3060 only) and more than one card.
+
+Checked against llama.cpp c622f62 (CPU, temperature 0) by feeding its greedy tokens through this forward: every top
+token is the same on a short prompt (24 of 24) and at most one differs on a prompt of several hundred tokens (48
+tokens, a near tie), on the CPU, CUDA and Vulkan paths. `tests/inkling2_forward.rs` runs these when
+`STRATA_INKLING2_MODEL` points at the file.
+Caveats: text only (the vision projector `inkling2v` is not read), decoding is greedy only, and prompt plus reply is
+limited to 32,768 tokens (`MAX_CTX` in `src/inkling2/forward.rs`). The GPU and CPU kernels round differently, so with
+the adaptive split and with chunked prefill the greedy text can differ from run to run at near-ties; chunked and
+token-by-token prefill give the same logits within 1e-3 on the CPU path.
+
 ## Development
 
 ```sh
@@ -268,7 +320,7 @@ python -I tools/parity.py $M --extra "--gpu" --tag gpu   # agreement with llama.
 Source map: `src/gguf.rs` (file reader), `src/quant/` (dequantization), `src/model.rs` (CPU reference forward),
 `src/cuda/` and `src/vulkan/` (GPU kernels, behind `src/backend.rs`), `src/gpu_model.rs` and
 `src/gpu_model/prefill.rs` (GPU forward and chunked prefill), `src/expert_cache.rs` (expert placement),
-`src/cpu_moe.rs` and `src/cpu_worker.rs` (CPU experts), `src/deepseek/` (DeepSeek-V4.1), `src/glm/` (GLM-5.3), `src/hy4/` (Hy4-flash), `src/serve.rs` (HTTP),
+`src/cpu_moe.rs` and `src/cpu_worker.rs` (CPU experts), `src/deepseek/` (DeepSeek-V4.1), `src/glm/` (GLM-5.3), `src/hy4/` (Hy4-flash), `src/inkling2/` (Inkling 2), `src/serve.rs` (HTTP),
 `src/chat.rs` (chat templates and tool calls), `src/main.rs` (CLI).
 
 ## License
